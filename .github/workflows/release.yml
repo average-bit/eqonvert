@@ -1,0 +1,47 @@
+name: Release
+
+# Runs when a version tag is pushed (e.g. v0.0.1). Cross-compiles the binary
+# for every supported OS/arch, packages each, and publishes a GitHub Release
+# with the archives attached so users can download and run without the source.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags so build.sh's `git describe` sees the tag
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build cross-platform binaries
+        run: bash build.sh
+
+      - name: Package archives + checksums
+        run: |
+          cd dist
+          for f in eqonvert-*; do
+            case "$f" in
+              *.exe) zip "${f%.exe}.zip" "$f" ;;
+              *)     tar -czf "$f.tar.gz" "$f" ;;
+            esac
+          done
+          sha256sum *.tar.gz *.zip > SHA256SUMS.txt
+          ls -lh
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true

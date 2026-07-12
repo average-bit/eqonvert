@@ -1,0 +1,35 @@
+# ── Build output ─────────────────────────────────────────────
+# the compiled binary itself (`go build .` / `go build -o eqonvert .`),
+# NOT the project source — all of cmd/, pkg/, main.go, etc. is tracked.
+/eqonvert
+*.exe
+/dist/
+/bin/
+/logs/
+/_dev/
+/out/
+/output/
+CHAR_dump_*/
+
+# ── OS cruft ─────────────────────────────────────────────────
+.DS_Store
+
+# ── Never commit game assets or extraction output ────────────
+# This tool only READS the player's own game files — the assets
+# themselves (and anything extracted from them) stay out of the repo.
+*.ESF
+*.esf
+*.CSF
+*.csf
+*.BGM
+*.bgm
+*.PSS
+*.pss
+*.16
+*.iso
+*.ISO
+# extraction output formats
+*.glb
+*.flac
+*.vag
+*.wav
