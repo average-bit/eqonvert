@@ -6,6 +6,7 @@
   community server emulator; its captured retail data supplies the model
   names and the AnimationState ID table.
 - The PS2 homebrew/RE community for Ghidra Emotion Engine tooling.
+- Shoutout to Ali for aiding me with Java extraction modifications forever ago.
 
 - This is alpha testing and has bugs - it is not perfect yet
 
