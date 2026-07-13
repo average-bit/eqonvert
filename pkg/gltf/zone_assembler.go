@@ -229,7 +229,10 @@ func (za *ZoneAssembler) embedOneSurface(s *eqoa.Surface) {
 	texIdx := len(za.b.Doc.Textures)
 	za.b.Doc.Textures = append(za.b.Doc.Textures, Texture{Source: imgIdx})
 	za.surfaceToIndex[s.DictID] = texIdx
-	za.surfaceAlphaMode[s.DictID] = s.AlphaMode()
+	// Route through alphaModeFor (blendGradients=false) so predominantly-
+	// translucent zone surfaces (glass, water) BLEND instead of getting shattered
+	// by MASK's hard cutoff, while foliage cutouts stay MASK (no colored halos).
+	za.surfaceAlphaMode[s.DictID] = alphaModeFor(s, false)
 }
 
 // buildMaterials creates GLTF materials for each entry in each matArr and appends
@@ -477,13 +480,58 @@ func (za *ZoneAssembler) AddSpriteMeshes(asset *eqoa.Asset, _ string, sbEast, sb
 	}
 }
 
+// AddUnlitMaterial appends a doubly-sided, fully-emissive (unlit-looking)
+// material of the given linear RGB colour and returns its index. Used for the
+// built-in spawn marker so it reads as a bright solid shape regardless of scene
+// lighting.
+func (za *ZoneAssembler) AddUnlitMaterial(name string, rgb [3]float32) int {
+	idx := len(za.b.Doc.Materials)
+	za.b.Doc.Materials = append(za.b.Doc.Materials, Material{
+		Name:           name,
+		DoubleSided:    true,
+		EmissiveFactor: []float32{rgb[0], rgb[1], rgb[2]},
+		PBRMetallicRoughness: &PBR{
+			BaseColorFactor: []float32{rgb[0], rgb[1], rgb[2], 1.0},
+			MetallicFactor:  0,
+			RoughnessFactor: 1,
+		},
+	})
+	return idx
+}
+
 // AddSpriteAtWorldPos places a non-terrain sprite at an absolute EQOA world position.
 // pos[0]=East, pos[1]=Height, pos[2]=North. rotY rotates around the EQOA Height
 // (vertical) axis in radians. scale is a uniform scale factor applied before
 // the world translation.
-func (za *ZoneAssembler) AddSpriteAtWorldPos(asset *eqoa.Asset, pos [3]float32, rotY, scale float32, matStart int) {
-	cosR := float32(math.Cos(float64(rotY)))
-	sinR := float32(math.Sin(float64(rotY)))
+func (za *ZoneAssembler) AddSpriteAtWorldPos(asset *eqoa.Asset, pos [3]float32, rot [3]float32, scale float32, matStart int) {
+	// Full Euler rotation about the EQOA local axes (East=X, Height=Y, North=Z):
+	// rot[0] yaw about Height (vertical), rot[1] pitch about East, rot[2] roll
+	// about North — composed intrinsically R = Ryaw·Rpitch·Rroll. This reduces
+	// EXACTLY to the previous yaw-only 2D rotation when rot[1]==rot[2]==0 (so
+	// props with only a heading are byte-for-byte unchanged); only the minority
+	// of actors that carry a pitch/roll (props following terrain slope) change.
+	cy := float32(math.Cos(float64(rot[0])))
+	sy := float32(math.Sin(float64(rot[0])))
+	cp := float32(math.Cos(float64(rot[1])))
+	sp := float32(math.Sin(float64(rot[1])))
+	cr := float32(math.Cos(float64(rot[2])))
+	sr := float32(math.Sin(float64(rot[2])))
+	// R = Ryaw(Y) · Rpitch(X) · Rroll(Z), row-major 3×3.
+	m00 := cy*cr - sy*sp*sr
+	m01 := -cy*sr - sy*sp*cr
+	m02 := -sy * cp
+	m10 := cp * sr
+	m11 := cp * cr
+	m12 := -sp
+	m20 := sy*cr + cy*sp*sr
+	m21 := -sy*sr + cy*sp*cr
+	m22 := cy * cp
+	// rotVec rotates a local (East,Height,North) vector by R.
+	rotVec := func(x, y, z float32) (float32, float32, float32) {
+		return m00*x + m01*y + m02*z,
+			m10*x + m11*y + m12*z,
+			m20*x + m21*y + m22*z
+	}
 
 	for _, mesh := range asset.Meshes {
 		for _, fg := range mesh.FaceGroups {
@@ -507,13 +555,13 @@ func (za *ZoneAssembler) AddSpriteAtWorldPos(asset *eqoa.Asset, pos [3]float32, 
 				le := v.Pos[0] * scale
 				lh := v.Pos[1] * scale
 				ln := v.Pos[2] * scale
-				// Rotate around EQOA Height axis (vertical yaw).
-				re := le*cosR - ln*sinR
-				rn := le*sinR + ln*cosR
+				// Rotate by the full Euler matrix, then map EQOA
+				// (East,Height,North) → glTF (East,North,-Height).
+				re, rh, rn := rotVec(le, lh, ln)
 				wp := [3]float32{
 					re + pos[0],
 					rn + pos[2],
-					-(lh + pos[1]),
+					-(rh + pos[1]),
 				}
 				if !za.hasPos {
 					za.MinPos, za.MaxPos = wp, wp
@@ -528,12 +576,11 @@ func (za *ZoneAssembler) AddSpriteAtWorldPos(asset *eqoa.Asset, pos [3]float32, 
 						}
 					}
 				}
-				ne := v.Normal[0]*cosR - v.Normal[2]*sinR
-				nn := v.Normal[0]*sinR + v.Normal[2]*cosR
+				ne, nh, nn := rotVec(v.Normal[0], v.Normal[1], v.Normal[2])
 				mg.vertices = append(mg.vertices, accVertex{
 					pos:    wp,
 					uv:     v.UV,
-					normal: [3]float32{ne, nn, -v.Normal[1]},
+					normal: [3]float32{ne, nn, -nh},
 				})
 			}
 			for _, idx := range fg.Indices {

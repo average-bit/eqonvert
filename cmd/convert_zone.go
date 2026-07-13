@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/average-bit/eqonvert/pkg/eqoa"
@@ -89,6 +90,11 @@ func parseSpriteLibrary(r io.ReadSeeker, objects []*eqoa.ESFObject, order binary
 		case 0x2C00:
 			add(o.DictID, o)
 			add(headerDictID(o, 0x2C10), o)
+		case 0x2700:
+			// GroupSprites (creatures such as the spawn placeholder) — index so
+			// they can be resolved as a placeholder / cross-file reference.
+			add(o.DictID, o)
+			add(headerDictID(o, 0x2710), o)
 		}
 		for _, c := range o.Children {
 			walk(c)
@@ -507,6 +513,29 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 
 	manifest := zoneManifest{Source: sourceName}
 
+	// Spawn marking: unresolved ZoneActors are cross-file references (mobs, NPCs —
+	// i.e. where spawns occur) we can't resolve to geometry and would otherwise
+	// drop silently. Flag each with a placeholder so spawn locations are visible.
+	//   --mark-spawns        → the built-in, self-contained marker (default)
+	//   ZONE_PLACEHOLDER=hex → advanced override: a real game sprite (must be in
+	//                          the cross-file library)
+	//   --spawn-scale        → size multiplier (markers are small vs a ~2000-unit zone)
+	useMarker := markSpawns
+	var placeholderEntry *spriteLibEntry
+	placeholderScale := float32(1.0)
+	if spawnScale > 0 {
+		placeholderScale = float32(spawnScale)
+	}
+	if idStr := os.Getenv("ZONE_PLACEHOLDER"); idStr != "" && lib != nil {
+		hexID := strings.TrimPrefix(strings.TrimPrefix(idStr, "0x"), "0X")
+		if id, err := strconv.ParseUint(hexID, 16, 32); err == nil {
+			placeholderEntry = lib[uint32(id)]
+		}
+		if placeholderEntry != nil {
+			useMarker = false // a resolvable game sprite overrides the built-in marker
+		}
+	}
+
 	var zoneBar *progressbar.ProgressBar
 	if verbose {
 		zoneBar = newBar(len(zones), fmt.Sprintf("%-20s", sourceName))
@@ -795,8 +824,14 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 			// Cache matStart per ZoneActor dictID to avoid duplicate material entries.
 			spriteMatStart := map[uint32]int{}
 
+			// Spawn placeholder asset for this zone (loaded lazily on the first
+			// unresolved actor; its geometry + materials are cached for the zone).
+			var placeholderAsset *eqoa.Asset
+			placeholderMatStart := 0
+			placeholderLoaded := false
+
 			// DEBUG (ZONE_ACTOR_DEBUG=1): instrument actor resolution.
-			var actTotal, actLocal, actLib, actLight, actEmpty, actSkip int
+			var actTotal, actLocal, actLib, actLight, actEmpty, actSkip, actPlaceholder int
 			unresolved := map[uint32]int{}
 
 			// Walk the ZoneActors tree (0x3290→0x3270→0x6040→0x6000) and place sprites.
@@ -812,7 +847,17 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 						math.Float32frombits(order.Uint32(body[8:12])),
 						math.Float32frombits(order.Uint32(body[12:16])),
 					}
-					rotY := math.Float32frombits(order.Uint32(body[16:20]))
+					// Euler rotation (3 angles): [0] yaw about the vertical (Height)
+					// axis; [1]/[2] pitch/roll tilts (used by props that follow
+					// terrain slope — bridges/fences/hedges). body[28:32] is scale
+					// (the 7th float, typically 1.0), NOT a sprite id — the sprite is
+					// the ZoneActor object's DictID. Confirmed via ParseZoneActor
+					// (Ghidra FUN_0040ff78): id·pos[3]·rot[3]·scale·color[4].
+					rot := [3]float32{
+						math.Float32frombits(order.Uint32(body[16:20])),
+						math.Float32frombits(order.Uint32(body[20:24])),
+						math.Float32frombits(order.Uint32(body[24:28])),
+					}
 					scale := math.Float32frombits(order.Uint32(body[28:32]))
 					if scale <= 0 || scale > 100 {
 						scale = 1.0
@@ -849,7 +894,35 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 					if sprObj == nil {
 						actSkip++
 						unresolved[o.DictID]++
-						return // cross-file reference (mob, character, etc.), skip
+						// Flag this unresolved (spawn) actor with a placeholder so the
+						// spawn location is visible: the built-in marker by default, or
+						// a real game sprite when ZONE_PLACEHOLDER resolves.
+						if useMarker || placeholderEntry != nil {
+							if !placeholderLoaded {
+								placeholderLoaded = true
+								if placeholderEntry != nil {
+									placeholderMatStart = za.LoadSpriteMaterials(placeholderEntry.r, placeholderEntry.obj, placeholderEntry.order)
+									if placeholderMatStart < 0 {
+										placeholderMatStart = 0
+									}
+									if a, e := eqoa.LoadAsset(placeholderEntry.r, placeholderEntry.obj, placeholderEntry.order); e == nil && len(a.Meshes) > 0 {
+										placeholderAsset = a
+									}
+								} else {
+									// Built-in designed marker (embedded .glb) — a bright
+									// downward "location pin" pointing at the spawn.
+									a, col := spawnMarkerAsset()
+									placeholderMatStart = za.AddUnlitMaterial("SpawnMarker", col)
+									placeholderAsset = a
+								}
+							}
+							if placeholderAsset != nil {
+								za.AddSpriteAtWorldPos(placeholderAsset, pos, rot, scale*placeholderScale, placeholderMatStart)
+								spriteCount++
+								actPlaceholder++
+							}
+						}
+						return // otherwise cross-file reference (mob, character, etc.), skip
 					}
 
 					matStart, cached := spriteMatStart[o.DictID]
@@ -871,7 +944,7 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 					} else {
 						actLocal++
 					}
-					za.AddSpriteAtWorldPos(asset, pos, rotY, scale, matStart)
+					za.AddSpriteAtWorldPos(asset, pos, rot, scale, matStart)
 					spriteCount++
 					return
 				}
@@ -882,8 +955,8 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 			walkActors(zoneActorsObj)
 
 			if os.Getenv("ZONE_ACTOR_DEBUG") != "" && actTotal > 0 {
-				fmt.Fprintf(os.Stderr, "[%s zone %d] actors=%d placed(local=%d lib=%d) lights=%d empty=%d skip=%d\n",
-					sourceName, zoneIdx, actTotal, actLocal, actLib, actLight, actEmpty, actSkip)
+				fmt.Fprintf(os.Stderr, "[%s zone %d] actors=%d placed(local=%d lib=%d) lights=%d empty=%d skip=%d placeholder=%d\n",
+					sourceName, zoneIdx, actTotal, actLocal, actLib, actLight, actEmpty, actSkip, actPlaceholder)
 				type mc struct {
 					id uint32
 					n  int
@@ -943,6 +1016,9 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 			entry.MaxPos = za.MaxPos
 		}
 		manifest.Zones = append(manifest.Zones, entry)
+		if progressStep != nil {
+			progressStep()
+		}
 		if zoneBar != nil {
 			zoneBar.Describe(fmt.Sprintf("%-14s zone %-4d", sourceName, zoneIdx))
 			zoneBar.Add(1)

@@ -19,6 +19,20 @@ import (
 
 var outputDir string
 
+// markSpawns places a built-in marker at every unresolved zone spawn actor;
+// spawnScale multiplies its size. See cmd/spawn_marker.go and convert_zone.go.
+var (
+	markSpawns bool
+	spawnScale float64
+)
+
+// progressStep, when non-nil, is called once per unit of intra-file work — each
+// sprite exported and each zone assembled. Single-file conversion of a large ESF
+// (e.g. a zone like TUNARIA) sets it so a spinner advances instead of the CLI
+// appearing hung; directory/ISO modes leave it nil, since their per-file bar
+// already moves.
+var progressStep func()
+
 var convertCmd = &cobra.Command{
 	Use:   "convert <path>",
 	Short: "Convert an EQOA asset file, directory, or disc image to GLB",
@@ -137,6 +151,25 @@ brew install ffmpeg libopenmpt`,
 		// resolve even in single-file mode.
 		lib := buildSpriteLibFromDir(filepath.Dir(path))
 		lightLib := buildLightLibFromDir(filepath.Dir(path))
+
+		// A single large ESF (a zone like TUNARIA) can take a while and has no
+		// per-file bar to move. Drive a spinner that advances per sprite/zone so
+		// the CLI shows it is working. Skipped in verbose mode (which already
+		// streams per-sprite lines) and for the quick raw formats (.16/.bgm/.pss).
+		if !verbose && !is16Ext(path) && !isBGMExt(path) && !isPSSExt(path) {
+			base := filepath.Base(path)
+			spin := newSpinner(fmt.Sprintf("Converting %s", base))
+			n := 0
+			progressStep = func() {
+				n++
+				spin.Describe(fmt.Sprintf("Converting %s (%d)", base, n))
+				spin.Add(1)
+			}
+			defer func() {
+				progressStep = nil
+				spin.Finish()
+			}()
+		}
 		convertAssetData(data, filepath.Base(path), out, out, registry, lib, lightLib)
 		return nil
 	},
@@ -570,6 +603,9 @@ func processObject(r io.ReadSeeker, obj *eqoa.ESFObject, order binary.ByteOrder,
 				}
 				generateGLB(r, asset, order, prefix, registry, verbose, outDir)
 				*sprites++
+				if progressStep != nil {
+					progressStep()
+				}
 			}
 		}()
 	}
@@ -638,5 +674,7 @@ func generateGLB(r io.ReadSeeker, asset *eqoa.Asset, order binary.ByteOrder, pre
 
 func init() {
 	convertCmd.Flags().StringVarP(&outputDir, "output", "o", "", "Output directory for GLB files (default: current directory)")
+	convertCmd.Flags().BoolVar(&markSpawns, "mark-spawns", false, "place a built-in marker at unresolved spawn actors in assembled zones")
+	convertCmd.Flags().Float64Var(&spawnScale, "spawn-scale", 1.0, "size multiplier for spawn markers (world units; markers are small vs a zone)")
 	rootCmd.AddCommand(convertCmd)
 }

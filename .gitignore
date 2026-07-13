@@ -30,6 +30,8 @@ CHAR_dump_*/
 *.ISO
 # extraction output formats
 *.glb
+# …except the committed built-in spawn-marker model (embedded in the binary)
+!cmd/assets/spawn_marker.glb
 *.flac
 *.vag
 *.wav
