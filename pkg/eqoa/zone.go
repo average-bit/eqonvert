@@ -7,18 +7,22 @@ import (
 )
 
 // ZoneActor represents a single actor placement in a zone (0x6000).
-// Confirmed layout via Ghidra decompile of VIESFParse__ParseZoneActor (0x40ff78):
+// Confirmed layout via Ghidra decompile of ParseZoneActor (FUN_0040ff78), which
+// reads the body as id · pos[3] · rot[3] · scale · color[4] and passes them to
+// the actor instantiation FUN_00437c50(scale, …, &pos, &rot, id, &color):
 //
-//	[0:4]   uint32      InstanceID — DictID of this placement record
+//	[0:4]   uint32      InstanceID — placement-record id (FUN_003ce058)
 //	[4:16]  [3]float32  Position   — world X, Y, Z
-//	[16:28] [3]float32  Rotation   — Euler angles (NOT quaternion)
-//	[28:32] uint32      SpriteID   — model hash ID (7th float, bit-reinterpreted)
+//	[16:28] [3]float32  Rotation   — Euler angles (NOT quaternion): [0] yaw about
+//	                                 Height, [1]/[2] pitch/roll (terrain-slope tilt)
+//	[28:32] float32     Scale      — the 7th float; typically 1.0 (NOT a SpriteID —
+//	                                 the sprite is the ZoneActor object's DictID)
 //	[32:36] [4]uint8    Color      — RGBA tint; typically [r,g,b,0xFF]
 type ZoneActor struct {
 	InstanceID uint32
 	Position   [3]float32
 	Rotation   [3]float32
-	SpriteID   uint32
+	Scale      float32
 	Color      [4]uint8
 }
 
@@ -37,9 +41,8 @@ func ParseZoneActor(data []byte, order binary.ByteOrder) (*ZoneActor, error) {
 	for i := range a.Rotation {
 		a.Rotation[i] = math.Float32frombits(order.Uint32(data[16+i*4:]))
 	}
-	// Bytes 28-31: the sprite model hash ID, stored as float32 in the file but
-	// used as a uint32 lookup key — reinterpret the bits directly.
-	a.SpriteID = order.Uint32(data[28:32])
+	// Bytes 28-31: the actor's uniform scale (7th float), typically 1.0.
+	a.Scale = math.Float32frombits(order.Uint32(data[28:32]))
 	copy(a.Color[:], data[32:36])
 
 	return a, nil

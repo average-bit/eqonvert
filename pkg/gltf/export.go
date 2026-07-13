@@ -68,7 +68,22 @@ func sanitizeFloat(f float32) float32 {
 // passes false, keeping foliage cutouts on MASK to avoid colored halos.
 func alphaModeFor(s *eqoa.Surface, blendGradients bool) string {
 	am := s.AlphaMode()
-	if blendGradients && am == "MASK" && s.TranslucentFraction() >= 0.05 {
+	if am != "MASK" {
+		return am
+	}
+	tf := s.TranslucentFraction()
+	// Character/item sheer cloth: even a faint translucency gradient should BLEND
+	// (see the garment-alpha fix).
+	if blendGradients && tf >= 0.05 {
+		return "BLEND"
+	}
+	// Predominantly-translucent surfaces (glass, water) must BLEND EVERYWHERE,
+	// zones included: MASK's hard 0.5 cutout shatters a smooth alpha gradient into
+	// jagged edges (the "glass looks horrible" bug — measured glass ≈ 0.58 mid-
+	// alpha band). Foliage/cutout masks are near-binary (measured ≤ 0.21, the vast
+	// majority < 0.1), so this high bar leaves them on MASK and avoids the
+	// colored-halo regression.
+	if tf >= 0.4 {
 		return "BLEND"
 	}
 	return am
@@ -125,6 +140,27 @@ func ExportAssetToBuilder(b *Builder, r io.ReadSeeker, asset *eqoa.Asset, order 
 			Name:                fmt.Sprintf("Skin_0x%X", asset.ID),
 		})
 		skinIdx = &sIdx
+	}
+
+	// Rigid-member props (windmill blades, banner cloth, …): an HSprite whose
+	// members are static SimpleSubSprites (no per-vertex skinning) authored in
+	// joint-local space, meant to be attached to animated joints — the idle
+	// animation places them (e.g. lifts the windmill blades / banner cloth into
+	// position; verified: SCENE windmill Joint_3 animates to Y≈25.82, the hub).
+	// The engine attaches member[i] to joint[i+1] (joint 0 is the base/root),
+	// which we detect by the invariant #joints == #members + 1 with no skinned
+	// mesh. Without this, members render frozen at their local origin (blades at
+	// ground / cloth hanging below the spar) and the skeleton is orphaned.
+	rigidMembers := false
+	if asset.Hierarchy != nil && skinIdx != nil && len(jointNodeIndices) == len(asset.Meshes)+1 {
+		anySkinned := false
+		for _, m := range asset.Meshes {
+			if m.Type == 5 {
+				anySkinned = true
+				break
+			}
+		}
+		rigidMembers = !anySkinned
 	}
 
 	surfaceToIndex := make(map[uint32]int)
@@ -249,10 +285,22 @@ func ExportAssetToBuilder(b *Builder, r io.ReadSeeker, asset *eqoa.Asset, order 
 							hasTexture = true
 						}
 					}
-					// No texture available: use a mid-grey placeholder so models are
-					// visible in any PBR viewer instead of rendering pure black.
 					if !hasTexture {
-						gm.PBRMetallicRoughness.BaseColorFactor = []float32{0.65, 0.65, 0.65, 1.0}
+						if len(m.Layers) == 0 {
+							// Empty material (no layers, no texture): a runtime-tinted
+							// shell such as the spirit "aura" envelope — the game applies
+							// its colour + blend per situation (e.g. red aura over red
+							// bones), so nothing is baked. Export as a translucent shell
+							// (neutral low-alpha) rather than opaque grey, so it doesn't
+							// occlude the inner mesh (the bones show through) and can be
+							// re-tinted downstream.
+							gm.AlphaMode = "BLEND"
+							gm.PBRMetallicRoughness.BaseColorFactor = []float32{1.0, 1.0, 1.0, 0.25}
+						} else {
+							// Material references a texture we couldn't resolve: mid-grey
+							// placeholder so it's visible instead of pure black.
+							gm.PBRMetallicRoughness.BaseColorFactor = []float32{0.65, 0.65, 0.65, 1.0}
+						}
 					}
 					matIdx := len(b.Doc.Materials)
 					b.Doc.Materials = append(b.Doc.Materials, gm)
@@ -404,11 +452,18 @@ func ExportAssetToBuilder(b *Builder, r io.ReadSeeker, asset *eqoa.Asset, order 
 		})
 		// Skinned mesh nodes must be scene-level roots — a parent transform on
 		// the sprite grouping node would corrupt the skinned result
-		// (NODE_SKINNED_MESH_NON_ROOT). Non-skinned nodes stay under the sprite
-		// root for grouping.
-		if nodeSkin != nil {
+		// (NODE_SKINNED_MESH_NON_ROOT).
+		switch {
+		case nodeSkin != nil:
 			b.AddSceneNode(meshNodeIdx)
-		} else {
+		case rigidMembers && i+1 < len(jointNodeIndices):
+			// Rigid prop member: parent under joint[i+1] so the joint's bind
+			// transform + idle animation position and animate it (windmill
+			// blades / banner cloth). See rigidMembers above.
+			jn := jointNodeIndices[i+1]
+			b.Doc.Nodes[jn].Children = append(b.Doc.Nodes[jn].Children, meshNodeIdx)
+		default:
+			// Non-skinned nodes stay under the sprite root for grouping.
 			b.Doc.Nodes[rootNodeIdx].Children = append(b.Doc.Nodes[rootNodeIdx].Children, meshNodeIdx)
 		}
 	}
