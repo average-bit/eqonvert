@@ -1,3 +1,14 @@
+# Acknowledgements
+
+- [joukop/ESF-file-format](https://github.com/joukop) — independent ESF
+  research that cross-checked several structures (PrimBuffer VGroups).
+- [EQOAGameServer / ReturnHome](https://github.com/EQOAProject) — the
+  community server emulator; its captured retail data supplies the model
+  names and the AnimationState ID table.
+- The PS2 homebrew/RE community for Ghidra Emotion Engine tooling.
+
+- This is alpha testing and has bugs - it is not perfect yet
+
 # eqonvert — EQOA asset extractor
 
 `eqonvert` converts game assets from **EQOA**
@@ -90,6 +101,8 @@ data files needed at runtime.
 
 ## Commands
 
+### stick to convert unless you want bugs and mistakes for now.
+
 | Command | Purpose |
 |---|---|
 | `convert <path>` | Assets → GLB. Accepts `.esf`, `.csf`, a directory, or an `.iso` |
@@ -141,15 +154,6 @@ docs/         Format documentation and the reverse-engineering evidence.
 | Particles / spell effects (0xC000/0xC200) | ✅ per-effect GLBs (`effects/…_effect_0x….glb`): visible sprite cards + full parameters in glTF `extras`; plus the `_particlefx.json` graph (spell→particle→texture resolves). Attach an effect GLB to any character's `Joint_N` node to position it — glTF has no standard particle sim, so engines drive emission from the embedded parameters (the industry-standard data+textures shape) |
 | Character customization | ✅ nothing to composite: player bodies ship complete with heads; the 80 CHARFACE face-variant textures export as PNG (applied by texture swap at char-create) |
 | Fonts (0x7000) | ⚠️ partially decoded: header + 256 glyph widths understood; glyph bitmap packing TBD |
-
-## Acknowledgements
-
-- [joukop/ESF-file-format](https://github.com/joukop) — independent ESF
-  research that cross-checked several structures (PrimBuffer VGroups).
-- [EQOAGameServer / ReturnHome](https://github.com/EQOAProject) — the
-  community server emulator; its captured retail data supplies the model
-  names and the AnimationState ID table.
-- The PS2 homebrew/RE community for Ghidra Emotion Engine tooling.
 
 ## License
 
