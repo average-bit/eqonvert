@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/average-bit/eqonvert/pkg/eqoa"
@@ -15,7 +16,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-var worldOut string
+var (
+	worldOut    string
+	worldServer string
+)
 
 var worldCmd = &cobra.Command{
 	Use:   "world <path>",
@@ -50,6 +54,13 @@ Browse it with any SQLite tool (e.g. Datasette). See docs/DICTIDS.md.`,
 		if err := writeWorld(db, regions); err != nil {
 			return err
 		}
+		if worldServer != "" {
+			n, err := importServer(db, worldServer)
+			if err != nil {
+				return fmt.Errorf("server import: %w", err)
+			}
+			logf("Imported %d spawn(s) from %s\n", n, worldServer)
+		}
 		logf("Wrote %s: %d region(s)\n", out, len(regions))
 		return nil
 	},
@@ -57,6 +68,7 @@ Browse it with any SQLite tool (e.g. Datasette). See docs/DICTIDS.md.`,
 
 func init() {
 	worldCmd.Flags().StringVarP(&worldOut, "output", "o", "world.db", "output SQLite database path")
+	worldCmd.Flags().StringVar(&worldServer, "server", "", "EQOAGameServer SQL dump to import spawns/names from (EQOA_Master.sql)")
 	rootCmd.AddCommand(worldCmd)
 }
 
@@ -246,8 +258,17 @@ CREATE TABLE zone_links (
   cardinal TEXT, bearing_deg REAL, gap REAL,
   PRIMARY KEY (zone_id, neighbor_id)
 );
+CREATE TABLE spawns (
+  spawn_id INTEGER PRIMARY KEY,
+  npc_name TEXT, world INTEGER, zone INTEGER,
+  model_dictid INTEGER REFERENCES models(model_dictid),
+  x REAL,y REAL,z REAL, facing INTEGER,
+  size REAL, hp INTEGER, npc_level INTEGER, npc_type INTEGER, race TEXT
+);
 CREATE INDEX ix_place_zone ON placements(zone_id);
 CREATE INDEX ix_place_model ON placements(model_dictid);
+CREATE INDEX ix_spawn_model ON spawns(model_dictid);
+CREATE INDEX ix_spawn_loc ON spawns(world,zone);
 CREATE VIEW v_unknown_models AS
   SELECT m.model_dictid, m.hex, m.placement_count
   FROM models m WHERE m.name IS NULL ORDER BY m.placement_count DESC;
@@ -473,4 +494,178 @@ func axisGap(aMin, aMax, bMin, bMax float64) float64 {
 func cardinal8(deg float64) string {
 	dirs := []string{"N", "NE", "E", "SE", "S", "SW", "W", "NW"}
 	return dirs[int((deg+22.5)/45)%8]
+}
+
+// --- server-side import (EQOAGameServer SQL dump) ----------------------------
+
+// npcs column indices (from the CREATE TABLE order).
+const (
+	npcName    = 1
+	npcZone    = 2
+	npcX       = 5
+	npcY       = 6
+	npcZ       = 7
+	npcFacing  = 8
+	npcWorld   = 9
+	npcHP      = 11
+	npcModelID = 13
+	npcSize    = 14
+	npcRace    = 33
+	npcLevel   = 35
+	npcType    = 36
+)
+
+// importServer parses the EQOAGameServer SQL dump and loads the `npcs` spawn
+// table into `spawns`, naming creature models from npc_name. The server stores a
+// DictID as a signed int32, so model_dictid = modelid & 0xFFFFFFFF. Returns the
+// number of spawns imported.
+func importServer(db *sql.DB, path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	rows := parseInsertRows(string(data), "npcs")
+
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	nameOf := map[uint32]string{}
+	n := 0
+	for _, f := range rows {
+		if len(f) <= npcType {
+			continue
+		}
+		mid, _ := strconv.ParseInt(f[npcModelID], 10, 64)
+		dict := uint32(mid) // signed int32 → DictID (low 32 bits)
+		n++
+		if _, err := tx.Exec(`INSERT INTO spawns VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			n, f[npcName], atoiOrNil(f[npcWorld]), atoiOrNil(f[npcZone]), int64(dict),
+			atofOrNil(f[npcX]), atofOrNil(f[npcY]), atofOrNil(f[npcZ]), atoiOrNil(f[npcFacing]),
+			atofOrNil(f[npcSize]), atoiOrNil(f[npcHP]), atoiOrNil(f[npcLevel]), atoiOrNil(f[npcType]), f[npcRace]); err != nil {
+			return 0, err
+		}
+		if f[npcName] != "" {
+			if _, ok := nameOf[dict]; !ok {
+				nameOf[dict] = f[npcName]
+			}
+		}
+	}
+
+	// Add/name creature models: ensure a models row exists, and name it (a client
+	// prop that's also a creature keeps its existing name if already known).
+	for dict, name := range nameOf {
+		tx.Exec(`INSERT OR IGNORE INTO models(model_dictid,hex,name,kind,placement_count) VALUES(?,?,?,'creature',0)`,
+			int64(dict), fmt.Sprintf("0x%08X", dict), name)
+		tx.Exec(`UPDATE models SET name=COALESCE(name,?), kind=CASE WHEN kind='unknown' THEN 'creature' ELSE kind END WHERE model_dictid=?`,
+			name, int64(dict))
+	}
+	return n, tx.Commit()
+}
+
+func atoiOrNil(s string) any {
+	if s == "" {
+		return nil
+	}
+	if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return v
+	}
+	return nil
+}
+
+func atofOrNil(s string) any {
+	if s == "" {
+		return nil
+	}
+	if v, err := strconv.ParseFloat(s, 64); err == nil {
+		return v
+	}
+	return nil
+}
+
+// parseInsertRows extracts every value tuple from all `INSERT INTO <table> VALUES
+// (...),(...);` statements in a MySQL dump. Quoted strings are unquoted; NULL
+// becomes "". Tolerant of \' and ” escapes and multi-row / multi-statement inserts.
+func parseInsertRows(sql, table string) [][]string {
+	var out [][]string
+	marker := "INSERT INTO `" + table + "`"
+	pos := 0
+	for {
+		s := strings.Index(sql[pos:], marker)
+		if s < 0 {
+			break
+		}
+		s += pos
+		v := strings.Index(sql[s:], "VALUES")
+		if v < 0 {
+			break
+		}
+		i := s + v + len("VALUES")
+		for i < len(sql) {
+			for i < len(sql) && sql[i] != '(' && sql[i] != ';' {
+				i++
+			}
+			if i >= len(sql) || sql[i] == ';' {
+				break
+			}
+			i++ // past '('
+			var fields []string
+			var cur strings.Builder
+			inStr := false
+			for i < len(sql) {
+				ch := sql[i]
+				if inStr {
+					if ch == '\\' && i+1 < len(sql) {
+						cur.WriteByte(sql[i+1])
+						i += 2
+						continue
+					}
+					if ch == '\'' {
+						if i+1 < len(sql) && sql[i+1] == '\'' {
+							cur.WriteByte('\'')
+							i += 2
+							continue
+						}
+						inStr = false
+						i++
+						continue
+					}
+					cur.WriteByte(ch)
+					i++
+					continue
+				}
+				if ch == '\'' {
+					inStr = true
+					i++
+					continue
+				}
+				if ch == ',' {
+					fields = append(fields, normNull(cur.String()))
+					cur.Reset()
+					i++
+					continue
+				}
+				if ch == ')' {
+					fields = append(fields, normNull(cur.String()))
+					i++
+					break
+				}
+				cur.WriteByte(ch)
+				i++
+			}
+			out = append(out, fields)
+		}
+		pos = i
+	}
+	return out
+}
+
+func normNull(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "NULL" {
+		return ""
+	}
+	return s
 }
