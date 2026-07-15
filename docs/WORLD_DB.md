@@ -29,7 +29,7 @@ model). Pure-Go SQLite (no cgo).
 
 | Table | Rows | Notes |
 |-------|------|-------|
-| `regions` | one per ESF/CSF file | TUNARIA, ODUS, RATHE… + AABB, counts |
+| `regions` | one per ESF/CSF file | `name` label + `source_file` (full disc/fs path) + AABB, counts |
 | `zones` | `0x3000` objects | AABB, `center_*`, `grid_x/grid_z`, `border_mask` |
 | `placements` | `0x6000` actors | **7-DOF**: `x,y,z / yaw,pitch,roll / scale` + RGBA, FK → model |
 | `models` | distinct DictIDs | `name` (NULL = unknown), `kind` = prop/creature/sentinel/unknown |

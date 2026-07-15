@@ -107,7 +107,7 @@ func collectRegions(src string) ([]regionRow, error) {
 				return nil
 			}
 			if data, e := os.ReadFile(p); e == nil {
-				if r, ok := regionFromData(data, regionNameFromPath(p)); ok {
+				if r, ok := regionFromData(data, regionNameFromPath(p), p); ok {
 					regions = append(regions, r)
 				}
 			}
@@ -123,7 +123,7 @@ func collectRegions(src string) ([]regionRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	if r, ok := regionFromData(data, regionNameFromPath(src)); ok {
+	if r, ok := regionFromData(data, regionNameFromPath(src), src); ok {
 		return []regionRow{r}, nil
 	}
 	return nil, nil
@@ -145,7 +145,7 @@ func collectRegionsFromISO(path string) ([]regionRow, error) {
 		if err != nil {
 			continue
 		}
-		if r, ok := regionFromData(data, regionNameFromPath(isoFile.Path)); ok {
+		if r, ok := regionFromData(data, regionNameFromPath(isoFile.Path), isoFile.Path); ok {
 			regions = append(regions, r)
 		}
 	}
@@ -164,7 +164,7 @@ func regionNameFromPath(p string) string {
 
 // regionFromData parses one ESF/CSF and extracts its zones + placements. Returns
 // ok=false when the file contains no Zone (0x3000) objects.
-func regionFromData(data []byte, name string) (regionRow, bool) {
+func regionFromData(data []byte, name, sourcePath string) (regionRow, bool) {
 	var r io.ReadSeeker
 	if len(data) >= 4 && string(data[:4]) == eqoa.MagicCESF {
 		dr, _, err := eqoa.DecompressCSF(bytes.NewReader(data))
@@ -181,7 +181,7 @@ func regionFromData(data []byte, name string) (regionRow, bool) {
 		return regionRow{}, false
 	}
 
-	reg := regionRow{name: name, sourceFile: name}
+	reg := regionRow{name: name, sourceFile: sourcePath}
 	f32 := func(b []byte) float32 { return math.Float32frombits(order.Uint32(b)) }
 
 	var collectZones func(o *eqoa.ESFObject)
