@@ -14,6 +14,10 @@ CHAR_dump_*/
 # ── OS cruft ─────────────────────────────────────────────────
 .DS_Store
 
+# ── Local tooling / agent workspaces (never commit) ──────────
+.claude/
+*.jsonl
+
 # ── Never commit game assets or extraction output ────────────
 # This tool only READS the player's own game files — the assets
 # themselves (and anything extracted from them) stay out of the repo.

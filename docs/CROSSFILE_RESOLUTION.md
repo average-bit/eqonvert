@@ -68,5 +68,4 @@ On disk this is a **`0xA010` ResourceDir** object → `ParseResourceTable` →
   (`0x00411010` calls it) — the runtime layout above is the target.
 - Confirm the offset base (absolute file offset vs relative to a section).
 - These are NOT spawns; the SpawnMarker feature can stay (rename `--mark-unresolved`)
-  but most "unresolved" become resolvable with this directory. See elfconv
-  `re_analysis/ZONE_ACTOR_RE.md` and memory `project_zone_spawn_placeholder`.
+  but most "unresolved" become resolvable with this directory.
