@@ -17,7 +17,7 @@ region  →  zone  →  placement  →  model
 eqonvert world <iso | dir | file.esf> -o world.db
 
 # + server spawns & creature names from the EQOAGameServer dump
-eqonvert world EverQuest_Online_Adventures.iso -o world.db \
+eqonvert world EQOA.iso -o world.db \
          --server EQOAGameServer/EQOA_Master.sql
 ```
 

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Block staged changes that introduce trademarked names into this public repo.
+# Checks only ADDED lines in the staged diff (case-insensitive). Existing
+# content is not re-scanned, so unrelated edits aren't blocked.
+#
+# Add terms to PATTERN as needed. Intentional bypass (rare): git commit --no-verify
+set -euo pipefail
+
+PATTERN='everquest|sony online entertainment'
+
+# Added lines in the staged diff, excluding the "+++" file-header lines and this
+# hook's own directory (which necessarily contains the pattern terms).
+offending="$(git diff --cached --diff-filter=ACM -U0 -- . ':(exclude).githooks/' \
+    | grep -E '^\+' \
+    | grep -vE '^\+\+\+' \
+    | grep -inE "$PATTERN" || true)"
+
+if [ -n "$offending" ]; then
+    echo "" >&2
+    echo "✖ pre-commit blocked: staged changes add a disallowed term." >&2
+    echo "  Pattern: ${PATTERN}" >&2
+    echo "  Offending added lines:" >&2
+    printf '%s\n' "$offending" | sed 's/^/      /' >&2
+    echo "  → Rephrase (e.g. use 'EQOA'), or bypass with: git commit --no-verify" >&2
+    echo "" >&2
+    exit 1
+fi
+exit 0
