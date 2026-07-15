@@ -85,6 +85,9 @@ brew install ffmpeg libopenmpt`,
 			// (trees, rocks, buildings) to LODSprite meshes in companion files.
 			lib := buildSpriteLibFromDir(path)
 			lightLib := buildLightLibFromDir(path)
+			// Cross-file resource directory (0x9000 ResourceTable union): recovers
+			// streamed static props and shared creatures/items the local scan misses.
+			resDir := buildResourceDirFromDir(path)
 
 			baseOut := outputDir
 			if baseOut == "" {
@@ -120,7 +123,7 @@ brew install ffmpeg libopenmpt`,
 				// per-file prefix dir. Both under baseOut.
 				mediaOut := filepath.Join(baseOut, srcSubdir(p))
 				esfOut := filepath.Join(baseOut, strings.TrimSuffix(base, filepath.Ext(base)))
-				totalSprites += convertAssetData(data, base, mediaOut, esfOut, registry, lib, lightLib)
+				totalSprites += convertAssetData(data, base, mediaOut, esfOut, registry, lib, lightLib, resDir)
 				bar.Add(1)
 			}
 			bar.Finish()
@@ -147,10 +150,11 @@ brew install ffmpeg libopenmpt`,
 		if !is16Ext(path) && !isBGMExt(path) && !isPSSExt(path) {
 			registry.PopulateFromESFData(data)
 		}
-		// Sprite/light libraries from sibling files so ZoneActor references
-		// resolve even in single-file mode.
+		// Sprite/light libraries + resource directory from sibling files so
+		// ZoneActor references resolve even in single-file mode.
 		lib := buildSpriteLibFromDir(filepath.Dir(path))
 		lightLib := buildLightLibFromDir(filepath.Dir(path))
+		resDir := buildResourceDirFromDir(filepath.Dir(path))
 
 		// A single large ESF (a zone like TUNARIA) can take a while and has no
 		// per-file bar to move. Drive a spinner that advances per sprite/zone so
@@ -170,7 +174,7 @@ brew install ffmpeg libopenmpt`,
 				spin.Finish()
 			}()
 		}
-		convertAssetData(data, filepath.Base(path), out, out, registry, lib, lightLib)
+		convertAssetData(data, filepath.Base(path), out, out, registry, lib, lightLib, resDir)
 		return nil
 	},
 }
@@ -196,7 +200,7 @@ func isPSSExt(path string) bool {
 // registry/lib/lightLib enable cross-file resolution for ESF sprites and zones.
 // Returns the number of sprites exported (0 for non-ESF assets).
 func convertAssetData(data []byte, name, mediaOut, esfOut string,
-	registry *eqoa.SurfaceRegistry, lib SpriteLibrary, lightLib LightLibrary) int {
+	registry *eqoa.SurfaceRegistry, lib SpriteLibrary, lightLib LightLibrary, resDir ResourceDirectory) int {
 	stem := strings.TrimSuffix(name, filepath.Ext(name))
 	switch {
 	case is16Ext(name):
@@ -217,7 +221,7 @@ func convertAssetData(data []byte, name, mediaOut, esfOut string,
 		}
 	default: // .esf / .csf
 		n := convertESFData(data, name, registry, verbose, esfOut)
-		convertZoneESFData(data, name, esfOut, verbose, lib, lightLib)
+		convertZoneESFData(data, name, esfOut, verbose, lib, lightLib, resDir)
 		return n
 	}
 	return 0
@@ -256,6 +260,7 @@ func convertISO(path string) error {
 	// resolve ZoneActor references (trees, rocks, buildings) to LODSprites.
 	lib := SpriteLibrary{}
 	lightLib := LightLibrary{}
+	resDir := ResourceDirectory{}
 	for _, isoFile := range files {
 		shortName := isoFile.Path[strings.LastIndexByte(isoFile.Path, '/')+1:]
 		regBar.Describe(fmt.Sprintf("Registry  %-20s", shortName))
@@ -279,9 +284,14 @@ func convertISO(path string) error {
 				lightLib[id] = ld
 			}
 		}
+		for id, entry := range resourceDirFromData(data) {
+			if _, exists := resDir[id]; !exists {
+				resDir[id] = entry
+			}
+		}
 	}
 	regBar.Finish()
-	logf("Surface registry: %d surfaces, sprite library: %d\n", registry.Len(), len(lib))
+	logf("Surface registry: %d surfaces, sprite library: %d, resource directory: %d\n", registry.Len(), len(lib), len(resDir))
 
 	// Pass 2: convert sprites with progress bar.
 	// Output mirrors the disc directory tree: DATA/CHAR/, DATA2/ARENA/, etc.
@@ -307,7 +317,7 @@ func convertISO(path string) error {
 			bar.Add(1)
 			continue
 		}
-		totalSprites += convertAssetData(data, shortName, mediaOut, esfOut, registry, lib, lightLib)
+		totalSprites += convertAssetData(data, shortName, mediaOut, esfOut, registry, lib, lightLib, resDir)
 		bar.Add(1)
 	}
 	bar.Finish()
