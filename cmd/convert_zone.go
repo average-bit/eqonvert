@@ -138,6 +138,80 @@ func spriteLibFromFile(path string) SpriteLibrary {
 	return spriteLibFromData(data)
 }
 
+// resourceEntry is one DictID's cross-file resource: the source reader, its byte
+// order, and the absolute offset/size of the object within that reader. The
+// object is parsed lazily on lookup (unlike spriteLibEntry, which pre-parses)
+// because the global directory can span very large files (CHAR ~148MB,
+// TUNARIA ~1GB) whose thousands of resources should not all be parsed up front.
+type resourceEntry struct {
+	r     io.ReadSeeker
+	order binary.ByteOrder
+	ref   eqoa.ResourceRef
+}
+
+// ResourceDirectory maps a ZoneActor DictID → the resource that resolves it,
+// unioned from the 0x9000 ResourceTable objects across the zone file and its
+// shared siblings (CHAR/AMBTRACK/ITEM/ITEMICON + the world/scene file). It is
+// the on-disk equivalent of the client's VIZone::Find directory and recovers
+// the streamed static props (~62% "zone_actor_skip") plus cross-file
+// creature/item placements the local sprite-library scan misses.
+type ResourceDirectory map[uint32]*resourceEntry
+
+// resourceDirFromData parses raw ESF/CSF bytes and returns a ResourceDirectory
+// backed by an in-memory reader over the (decompressed) stream. The reader is
+// retained in each entry so lookups can seek+parse the referenced object.
+func resourceDirFromData(data []byte) ResourceDirectory {
+	var r io.ReadSeeker
+	if len(data) >= 4 && string(data[:4]) == eqoa.MagicCESF {
+		dr, _, err := eqoa.DecompressCSF(bytes.NewReader(data))
+		if err != nil {
+			return nil
+		}
+		all, err := io.ReadAll(dr)
+		if err != nil {
+			return nil
+		}
+		r = bytes.NewReader(all)
+	} else {
+		r = bytes.NewReader(data)
+	}
+	_, objects, _, order, err := eqoa.ParseESF(r)
+	if err != nil {
+		return nil
+	}
+	refs := eqoa.ParseResourceTables(r, objects, order)
+	if len(refs) == 0 {
+		return nil
+	}
+	dir := make(ResourceDirectory, len(refs))
+	for id, ref := range refs {
+		dir[id] = &resourceEntry{r: r, order: order, ref: ref}
+	}
+	return dir
+}
+
+// buildResourceDirFromDir scans a directory for ESF/CSF files and merges their
+// resource directories (first-seen DictID wins). Mirrors buildSpriteLibFromDir.
+func buildResourceDirFromDir(dir string) ResourceDirectory {
+	merged := ResourceDirectory{}
+	filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !isAssetExt(p) {
+			return nil
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+		for id, entry := range resourceDirFromData(data) {
+			if _, exists := merged[id]; !exists {
+				merged[id] = entry
+			}
+		}
+		return nil
+	})
+	return merged
+}
+
 var convertZoneCmd = &cobra.Command{
 	Use:   "convert-zone <path>",
 	Short: "Assemble per-zone GLBs from EQOA zone ESF files",
@@ -172,6 +246,7 @@ Output: PREFIX_zone_N.glb per zone + PREFIX_zones.json manifest.`,
 			// Build sprite + light libraries from companion files (SCENE.ESF etc).
 			lib := buildSpriteLibFromDir(path)
 			lightLib := buildLightLibFromDir(path)
+			resDir := buildResourceDirFromDir(path)
 
 			// Pass 1: collect ESF/CSF paths.
 			var esfPaths []string
@@ -193,7 +268,7 @@ Output: PREFIX_zone_N.glb per zone + PREFIX_zones.json manifest.`,
 					bar.Add(1)
 					continue
 				}
-				totalZones += convertZoneESFData(data, base, outDir, verbose, lib, lightLib)
+				totalZones += convertZoneESFData(data, base, outDir, verbose, lib, lightLib, resDir)
 				bar.Add(1)
 			}
 			bar.Finish()
@@ -213,7 +288,8 @@ Output: PREFIX_zone_N.glb per zone + PREFIX_zones.json manifest.`,
 		}
 		lib := buildSpriteLibFromDir(filepath.Dir(path))
 		lightLib := buildLightLibFromDir(filepath.Dir(path))
-		if n := convertZoneESFData(data, filepath.Base(path), outDir, verbose, lib, lightLib); n > 0 {
+		resDir := buildResourceDirFromDir(filepath.Dir(path))
+		if n := convertZoneESFData(data, filepath.Base(path), outDir, verbose, lib, lightLib, resDir); n > 0 {
 			logf("%d zone GLB(s)\n", n)
 		}
 		return nil
@@ -357,9 +433,11 @@ func convertZoneISO(isoPath, outDir string) {
 		logf("Error reading ISO: %v\n", err)
 		return
 	}
-	// Build sprite + light libraries from all files on the disc (finds SCENE.ESF etc).
+	// Build sprite + light libraries and the cross-file resource directory from
+	// all files on the disc (finds SCENE.ESF etc).
 	lib := SpriteLibrary{}
 	lightLib := LightLibrary{}
+	resDir := ResourceDirectory{}
 	for _, isoFile := range files {
 		data, err := isoFile.ReadAll(f)
 		if err != nil {
@@ -375,6 +453,11 @@ func convertZoneISO(isoPath, outDir string) {
 				lightLib[id] = ld
 			}
 		}
+		for id, entry := range resourceDirFromData(data) {
+			if _, exists := resDir[id]; !exists {
+				resDir[id] = entry
+			}
+		}
 	}
 
 	bar := newBar(len(files), "Assembling zones")
@@ -387,7 +470,7 @@ func convertZoneISO(isoPath, outDir string) {
 			bar.Add(1)
 			continue
 		}
-		n := convertZoneESFData(data, shortName, outDir, false, lib, lightLib)
+		n := convertZoneESFData(data, shortName, outDir, false, lib, lightLib, resDir)
 		totalZones += n
 		bar.Add(1)
 	}
@@ -444,8 +527,10 @@ func buildGlobalSurfacePool(objects []*eqoa.ESFObject, r io.ReadSeeker, order bi
 // writes one assembled GLB per zone plus a JSON manifest. Files without zones
 // are silently skipped. verbose=true prints per-zone progress lines.
 // lib provides LODSprite geometry from companion files (e.g. SCENE.ESF); pass nil if unavailable.
+// resDir is the cross-file resource directory (0x9000 ResourceTable union) used
+// to resolve ZoneActor DictIDs the local sprite scan misses; pass nil to disable.
 // Returns the number of zone GLBs written.
-func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, lib SpriteLibrary, lightLib LightLibrary) int {
+func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, lib SpriteLibrary, lightLib LightLibrary, resDir ResourceDirectory) int {
 	var esfReader io.ReadSeeker
 
 	if len(data) >= 4 && string(data[:4]) == eqoa.MagicCESF {
@@ -830,8 +915,13 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 			placeholderMatStart := 0
 			placeholderLoaded := false
 
+			// Cross-file resource directory: parse-once cache of objects resolved
+			// via the 0x9000 ResourceTable (keyed by DictID). Nil object means the
+			// offset was parsed but yielded no usable geometry.
+			resObjCache := map[uint32]*eqoa.ESFObject{}
+
 			// DEBUG (ZONE_ACTOR_DEBUG=1): instrument actor resolution.
-			var actTotal, actLocal, actLib, actLight, actEmpty, actSkip, actPlaceholder int
+			var actTotal, actLocal, actLib, actDir, actLight, actEmpty, actSkip, actPlaceholder int
 			unresolved := map[uint32]int{}
 
 			// Walk the ZoneActors tree (0x3290→0x3270→0x6040→0x6000) and place sprites.
@@ -881,6 +971,7 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 					)
 					actTotal++
 					viaLib := false
+					viaDir := false
 					if spr, ok := spriteByID[o.DictID]; ok {
 						sprObj = spr
 					} else if lib != nil {
@@ -889,6 +980,34 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 							sprR = entry.r
 							sprOrder = entry.order
 							viaLib = true
+						}
+					}
+					// Cross-file resource directory: the client streams static
+					// props (buildings/civil arch) and shared creatures/items in via
+					// a DictID→offset table the local sprite scan doesn't cover.
+					if sprObj == nil && resDir != nil {
+						if entry, ok := resDir[o.DictID]; ok {
+							obj, cached := resObjCache[o.DictID]
+							if !cached {
+								if parsed, err := eqoa.ReadObjectAt(entry.r, entry.order, int64(entry.ref.Offset)); err == nil {
+									// Integrity check: the directory records the full
+									// target object size (12-byte header + body), so a
+									// correctly-aligned offset must satisfy
+									// ObjectSize+12 == ref.Size. A mismatch means a bad
+									// offset (misaligned/corrupt) — skip rather than feed
+									// garbage to LoadAsset.
+									if entry.ref.Size == 0 || uint32(parsed.Header.ObjectSize)+uint32(eqoa.ObjectHeaderSize) == entry.ref.Size {
+										obj = parsed
+									}
+								}
+								resObjCache[o.DictID] = obj
+							}
+							if obj != nil {
+								sprObj = obj
+								sprR = entry.r
+								sprOrder = entry.order
+								viaDir = true
+							}
 						}
 					}
 					if sprObj == nil {
@@ -939,9 +1058,12 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 						actEmpty++
 						return
 					}
-					if viaLib {
+					switch {
+					case viaDir:
+						actDir++
+					case viaLib:
 						actLib++
-					} else {
+					default:
 						actLocal++
 					}
 					za.AddSpriteAtWorldPos(asset, pos, rot, scale, matStart)
@@ -955,8 +1077,8 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 			walkActors(zoneActorsObj)
 
 			if os.Getenv("ZONE_ACTOR_DEBUG") != "" && actTotal > 0 {
-				fmt.Fprintf(os.Stderr, "[%s zone %d] actors=%d placed(local=%d lib=%d) lights=%d empty=%d skip=%d placeholder=%d\n",
-					sourceName, zoneIdx, actTotal, actLocal, actLib, actLight, actEmpty, actSkip, actPlaceholder)
+				fmt.Fprintf(os.Stderr, "[%s zone %d] actors=%d placed(local=%d lib=%d dir=%d) lights=%d empty=%d skip=%d placeholder=%d\n",
+					sourceName, zoneIdx, actTotal, actLocal, actLib, actDir, actLight, actEmpty, actSkip, actPlaceholder)
 				type mc struct {
 					id uint32
 					n  int
