@@ -1104,6 +1104,20 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 		// Merge all accumulated per-material geometry into a single mesh.
 		za.FinalizeZoneMesh(fmt.Sprintf("zone-%d", zoneIdx))
 
+		// Opt-in: emit this zone's collision geometry (0x4200 CollBuffer) as a
+		// separate node tagged {"collision":true}. Kept out of the visual mesh so
+		// the default export is unchanged when --collision is absent.
+		if collisionExport {
+			pos, tris, nColl := collectZoneCollision(esfReader, zoneObj, order)
+			if nColl > 0 {
+				za.Builder().AddCollisionNode("collision", pos, tris)
+				if verbose {
+					logf("  zone %d: collision %d verts / %d tris from %d CollBuffers\n",
+						zoneIdx, len(pos), len(tris)/3, nColl)
+				}
+			}
+		}
+
 		// Write zone GLBs into a zones/ subdirectory for easy navigation.
 		zonesDir := filepath.Join(outDir, "zones")
 		if err := os.MkdirAll(zonesDir, 0755); err != nil {
@@ -1165,7 +1179,54 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 	return len(manifest.Zones)
 }
 
+// collectZoneCollision walks a Zone (0x3000) subtree, decodes every 0x4200
+// CollBuffer under it, and merges them into a single world-space position array
+// plus a flat triangle-list index buffer. Returns the merged positions, indices,
+// and the number of CollBuffers successfully decoded.
+//
+// The type-2 base-vertex table (the zone render-mesh pool) is not threaded in:
+// observed zone data uses baseIdx 0 throughout, so type-2 vertices decode exactly
+// with a zero base. See ParseCollBuffer for the documented best-effort behaviour.
+func collectZoneCollision(r io.ReadSeeker, zoneObj *eqoa.ESFObject, order binary.ByteOrder) ([][3]float32, []uint32, int) {
+	var positions [][3]float32
+	var indices []uint32
+	n := 0
+
+	var walk func(o *eqoa.ESFObject)
+	walk = func(o *eqoa.ESFObject) {
+		if uint16(o.Header.ObjectType) == 0x4200 {
+			body, err := o.ReadBody(r)
+			if err == nil {
+				cb, err := eqoa.ParseCollBuffer(body, order, int(o.Header.ObjectVersion), nil)
+				if err == nil && len(cb.Positions) > 0 {
+					base := uint32(len(positions))
+					// CollBuffer positions are absolute EQOA world space
+					// (x=East, y=Height, z=North). Apply the same axis remap the
+					// visual terrain uses (see ZoneAssembler.AddSpriteMeshes:
+					// GLB.X=East, GLB.Y=North, GLB.Z=-Height) so the collision node
+					// aligns with the rendered geometry. No pretranslation offset is
+					// added — collision coords already carry the world anchor.
+					for _, p := range cb.Positions {
+						positions = append(positions, [3]float32{p[0], p[2], -p[1]})
+					}
+					for _, idx := range cb.Triangles {
+						indices = append(indices, base+idx)
+					}
+					n++
+				}
+			}
+			return
+		}
+		for _, c := range o.Children {
+			walk(c)
+		}
+	}
+	walk(zoneObj)
+	return positions, indices, n
+}
+
 func init() {
 	convertZoneCmd.Flags().StringVarP(&outputDir, "output", "o", "", "Output directory for assembled zone GLBs (default: current directory)")
+	convertZoneCmd.Flags().BoolVar(&collisionExport, "collision", false, "Also export zone collision geometry (0x4200 CollBuffer) as a separate 'collision' glTF node (default off)")
 	rootCmd.AddCommand(convertZoneCmd)
 }

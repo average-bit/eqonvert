@@ -2,6 +2,8 @@ package gltf
 
 import (
 	"bytes"
+	"encoding/binary"
+	"encoding/json"
 	"io"
 )
 
@@ -101,6 +103,62 @@ func (b *Builder) AddLightNode(name string, pos [3]float32, lightIdx int) int {
 		Name:        name,
 		Translation: []float32{pos[0], pos[1], pos[2]},
 		Extensions:  &NodeExtensions{Light: &NodeLightRef{Light: lightIdx}},
+	})
+	b.AddSceneNode(nodeIdx)
+	return nodeIdx
+}
+
+// AddCollisionNode appends a triangle-mesh node built from world-space positions
+// and a flat triangle-list index buffer, tagged with extras {"collision": true}
+// so downstream apps can filter it out of the visual scene. It returns the node
+// index, or -1 if there is nothing to emit. The node is added to the scene root.
+func (b *Builder) AddCollisionNode(name string, positions [][3]float32, indices []uint32) int {
+	if len(positions) == 0 || len(indices) < 3 {
+		return -1
+	}
+
+	// Positions -> f32x3 buffer view + accessor (with min/max, required by spec
+	// for POSITION accessors).
+	posBuf := new(bytes.Buffer)
+	minv := [3]float32{positions[0][0], positions[0][1], positions[0][2]}
+	maxv := minv
+	for _, p := range positions {
+		for k := 0; k < 3; k++ {
+			if p[k] < minv[k] {
+				minv[k] = p[k]
+			}
+			if p[k] > maxv[k] {
+				maxv[k] = p[k]
+			}
+			binary.Write(posBuf, binary.LittleEndian, p[k])
+		}
+	}
+	posBv := b.AddBufferView(posBuf.Bytes(), 34962) // ARRAY_BUFFER
+	posAcc := b.AddAccessor(posBv, 0, 5126, len(positions), "VEC3", false)
+	b.Doc.Accessors[posAcc].Min = []float32{minv[0], minv[1], minv[2]}
+	b.Doc.Accessors[posAcc].Max = []float32{maxv[0], maxv[1], maxv[2]}
+
+	// Indices -> u32 buffer view + accessor.
+	idxBuf := new(bytes.Buffer)
+	for _, idx := range indices {
+		binary.Write(idxBuf, binary.LittleEndian, idx)
+	}
+	idxBv := b.AddBufferView(idxBuf.Bytes(), 34963) // ELEMENT_ARRAY_BUFFER
+	idxAcc := b.AddAccessor(idxBv, 0, 5125, len(indices), "SCALAR", false)
+
+	mesh := Mesh{
+		Name: name,
+		Primitives: []Primitive{{
+			Attributes: map[string]int{"POSITION": posAcc},
+			Indices:    &idxAcc,
+		}},
+	}
+	meshIdx := b.AddMesh(mesh)
+
+	nodeIdx := b.AddNode(Node{
+		Name:   name,
+		Mesh:   &meshIdx,
+		Extras: json.RawMessage(`{"collision":true}`),
 	})
 	b.AddSceneNode(nodeIdx)
 	return nodeIdx

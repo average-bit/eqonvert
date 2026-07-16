@@ -94,6 +94,10 @@ type Node struct {
 	Rotation    []float32       `json:"rotation,omitempty"`
 	Scale       []float32       `json:"scale,omitempty"`
 	Extensions  *NodeExtensions `json:"extensions,omitempty"`
+	// Extras is the glTF-sanctioned carrier for application-specific data
+	// (ignored by viewers). Used to tag the collision node so downstream apps
+	// can filter it out of the visual scene.
+	Extras json.RawMessage `json:"extras,omitempty"`
 }
 
 type Skin struct {
