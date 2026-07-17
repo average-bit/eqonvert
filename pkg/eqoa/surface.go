@@ -57,16 +57,15 @@ func ParseSurface(data []byte, order binary.ByteOrder) (*Surface, error) {
 		}
 		offset += paletteSize
 
-		// PSMT8 (256-color) CLUT de-swizzle: the PS2 GS stores 256-color palettes
-		// with entries [8..15] and [16..23] swapped within every 32-entry block.
-		// PSMT4 (16-color) is stored linearly and needs no correction.
-		if s.Depth == 1 && paletteEntries == 256 {
-			for base := 0; base < 256; base += 32 {
-				for j := 0; j < 8; j++ {
-					s.Palette[base+8+j], s.Palette[base+16+j] = s.Palette[base+16+j], s.Palette[base+8+j]
-				}
-			}
-		}
+		// NOTE: ESF-stored CLUTs are LINEAR, not in the PS2 GS "swizzled" order.
+		// A previous PSMT8 256-color CLUT de-swizzle (swapping palette entries
+		// [8..15]<->[16..23] per 32-entry block) was WRONG here: it scrambled any
+		// texture whose art sweeps those index ranges — e.g. item-icon faded
+		// radial gradients turned into pink/green speckle, while textures that
+		// avoided those indices looked fine (the "random" symptom). Verified by
+		// three-way decode of ITEMICON 0xB8E7D93C (128x64, PSMT8, 256-color): the
+		// linear palette renders the correct smooth gradient; the de-swizzle does
+		// not. So no CLUT reorder is applied.
 
 		// PS2 color-key: magenta (R=255, G=0, B=255) palette entries were rendered
 		// transparent by the GS color-comparison feature. Their stored alpha was
