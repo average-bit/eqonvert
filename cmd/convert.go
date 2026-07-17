@@ -26,6 +26,11 @@ var (
 	spawnScale float64
 )
 
+// collisionExport, when set, emits each zone's decoded 0x4200 CollBuffer geometry
+// as a separate "collision" glTF node (tagged extras {"collision":true}). Default
+// OFF so the normal visual export is byte-for-byte unchanged. See convert_zone.go.
+var collisionExport bool
+
 // progressStep, when non-nil, is called once per unit of intra-file work — each
 // sprite exported and each zone assembled. Single-file conversion of a large ESF
 // (e.g. a zone like TUNARIA) sets it so a spinner advances instead of the CLI
