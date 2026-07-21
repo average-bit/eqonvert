@@ -66,8 +66,11 @@ func zoneTileName(prefix string, minPos, maxPos [3]float32) string {
 	}
 	world := tileData.Worlds[w]
 
+	// Zone bounds are in GLB world space (East=X, Height=Y, North=Z). The map
+	// tile grid is a 2D East×North layout, so column = East and row = North —
+	// the North axis is index [2] (Y is height/up after the Y-up orientation).
 	cx := float64(minPos[0]+maxPos[0]) / 2
-	cy := float64(minPos[1]+maxPos[1]) / 2
+	cy := float64(minPos[2]+maxPos[2]) / 2
 	col, row := int(cx/2000), int(cy/2000)
 	if row < 0 || row >= len(world.TileGrid) || col < 0 || col >= len(world.TileGrid[row]) {
 		return ""

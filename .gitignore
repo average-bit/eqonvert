@@ -39,3 +39,6 @@ CHAR_dump_*/
 *.flac
 *.vag
 *.wav
+
+# Local-only tech-debt log (not for remote)
+TECH_DEBT.md

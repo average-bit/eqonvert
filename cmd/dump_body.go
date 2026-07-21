@@ -66,7 +66,7 @@ var dumpBodyCmd = &cobra.Command{
 }
 
 func init() {
-	rootCmd.AddCommand(dumpBodyCmd)
+	devCmd.AddCommand(dumpBodyCmd)
 }
 
 func dumpRecursive(r io.ReadSeeker, objects []*eqoa.ESFObject, targetType uint16, order binary.ByteOrder, dir string, count *int) {

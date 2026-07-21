@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/average-bit/eqonvert/pkg/eqoa"
 	"github.com/average-bit/eqonvert/pkg/gltf"
@@ -138,13 +139,61 @@ func spriteLibFromFile(path string) SpriteLibrary {
 	return spriteLibFromData(data)
 }
 
-// resourceEntry is one DictID's cross-file resource: the source reader, its byte
-// order, and the absolute offset/size of the object within that reader. The
-// object is parsed lazily on lookup (unlike spriteLibEntry, which pre-parses)
-// because the global directory can span very large files (CHAR ~148MB,
-// TUNARIA ~1GB) whose thousands of resources should not all be parsed up front.
+// resourceSource lazily provides the decompressed ESF stream of one resource
+// file. It decompresses at most once — on the first lookup that actually needs
+// the file — and caches the bytes. Files whose DictIDs are never resolved during
+// zone assembly are therefore never held resident. This is the fix for the
+// multi-GB resident memory a full-disc conversion otherwise pays: the old design
+// decompressed AND retained every file (TUNARIA ~1 GB, CHAR ~148 MB, …) up front.
+type resourceSource struct {
+	open func() ([]byte, error) // reads the RAW file bytes (filesystem or ISO)
+	once sync.Once
+	data []byte
+	err  error
+}
+
+// reader returns a fresh ReadSeeker over the file's decompressed bytes,
+// decompressing (once) on first use. Each call hands out a new bytes.Reader over
+// the shared buffer, so independent seeks (ReadObjectAt, then LoadSpriteMaterials)
+// never fight over one cursor.
+func (s *resourceSource) reader() (io.ReadSeeker, error) {
+	s.once.Do(func() {
+		raw, err := s.open()
+		if err != nil {
+			s.err = err
+			return
+		}
+		s.data = decompressResourceBytes(raw)
+	})
+	if s.err != nil {
+		return nil, s.err
+	}
+	return bytes.NewReader(s.data), nil
+}
+
+// decompressResourceBytes returns the decompressed ESF stream for a raw resource
+// file (CSF → inflate; plain ESF → returned as-is). Returns nil on error.
+func decompressResourceBytes(data []byte) []byte {
+	if len(data) >= 4 && string(data[:4]) == eqoa.MagicCESF {
+		dr, _, err := eqoa.DecompressCSF(bytes.NewReader(data))
+		if err != nil {
+			return nil
+		}
+		all, err := io.ReadAll(dr)
+		if err != nil {
+			return nil
+		}
+		return all
+	}
+	return data
+}
+
+// resourceEntry is one DictID's cross-file resource: its byte order, the absolute
+// offset/size of the object within the source stream, and a shared lazy source
+// for the file it lives in. The object is parsed lazily on lookup (unlike
+// spriteLibEntry, which pre-parses).
 type resourceEntry struct {
-	r     io.ReadSeeker
+	src   *resourceSource
 	order binary.ByteOrder
 	ref   eqoa.ResourceRef
 }
@@ -157,24 +206,18 @@ type resourceEntry struct {
 // creature/item placements the local sprite-library scan misses.
 type ResourceDirectory map[uint32]*resourceEntry
 
-// resourceDirFromData parses raw ESF/CSF bytes and returns a ResourceDirectory
-// backed by an in-memory reader over the (decompressed) stream. The reader is
-// retained in each entry so lookups can seek+parse the referenced object.
-func resourceDirFromData(data []byte) ResourceDirectory {
-	var r io.ReadSeeker
-	if len(data) >= 4 && string(data[:4]) == eqoa.MagicCESF {
-		dr, _, err := eqoa.DecompressCSF(bytes.NewReader(data))
-		if err != nil {
-			return nil
-		}
-		all, err := io.ReadAll(dr)
-		if err != nil {
-			return nil
-		}
-		r = bytes.NewReader(all)
-	} else {
-		r = bytes.NewReader(data)
+// resourceDirFromData parses the 0x9000 resource tables out of raw ESF/CSF bytes
+// and returns a ResourceDirectory whose entries share one lazy resourceSource.
+// The `open` closure re-reads the RAW file bytes on demand (from the filesystem
+// or an ISO), so the decompressed stream used here to read the tables is NOT
+// retained — it is dropped when this function returns and re-materialized only if
+// a lookup actually hits this file.
+func resourceDirFromData(data []byte, open func() ([]byte, error)) ResourceDirectory {
+	dec := decompressResourceBytes(data)
+	if dec == nil {
+		return nil
 	}
+	r := bytes.NewReader(dec)
 	_, objects, _, order, err := eqoa.ParseESF(r)
 	if err != nil {
 		return nil
@@ -183,9 +226,10 @@ func resourceDirFromData(data []byte) ResourceDirectory {
 	if len(refs) == 0 {
 		return nil
 	}
+	src := &resourceSource{open: open}
 	dir := make(ResourceDirectory, len(refs))
 	for id, ref := range refs {
-		dir[id] = &resourceEntry{r: r, order: order, ref: ref}
+		dir[id] = &resourceEntry{src: src, order: order, ref: ref}
 	}
 	return dir
 }
@@ -202,7 +246,8 @@ func buildResourceDirFromDir(dir string) ResourceDirectory {
 		if err != nil {
 			return nil
 		}
-		for id, entry := range resourceDirFromData(data) {
+		// p is the Walk callback's parameter (unique per call), safe to capture.
+		for id, entry := range resourceDirFromData(data, func() ([]byte, error) { return os.ReadFile(p) }) {
 			if _, exists := merged[id]; !exists {
 				merged[id] = entry
 			}
@@ -215,6 +260,10 @@ func buildResourceDirFromDir(dir string) ResourceDirectory {
 var convertZoneCmd = &cobra.Command{
 	Use:   "convert-zone <path>",
 	Short: "Assemble per-zone GLBs from EQOA zone ESF files",
+	// Lives under `eqonvert dev` — the tool's focal point is `convert`, which
+	// extracts everything (models, textures, audio, assembled zones with animated
+	// props) from a disc in one pass. convert-zone is the standalone zone-assembly
+	// entry point, kept for reverse-engineering/debugging.
 	Long: `Assembles all terrain sprites within each Zone object into a single GLB.
 
 Accepts:
@@ -268,7 +317,7 @@ Output: PREFIX_zone_N.glb per zone + PREFIX_zones.json manifest.`,
 					bar.Add(1)
 					continue
 				}
-				totalZones += convertZoneESFData(data, base, outDir, verbose, lib, lightLib, resDir)
+				totalZones += convertZoneESFData(data, base, outDir, verbose, lib, lightLib, resDir, nil)
 				bar.Add(1)
 			}
 			bar.Finish()
@@ -289,7 +338,7 @@ Output: PREFIX_zone_N.glb per zone + PREFIX_zones.json manifest.`,
 		lib := buildSpriteLibFromDir(filepath.Dir(path))
 		lightLib := buildLightLibFromDir(filepath.Dir(path))
 		resDir := buildResourceDirFromDir(filepath.Dir(path))
-		if n := convertZoneESFData(data, filepath.Base(path), outDir, verbose, lib, lightLib, resDir); n > 0 {
+		if n := convertZoneESFData(data, filepath.Base(path), outDir, verbose, lib, lightLib, resDir, nil); n > 0 {
 			logf("%d zone GLB(s)\n", n)
 		}
 		return nil
@@ -439,6 +488,7 @@ func convertZoneISO(isoPath, outDir string) {
 	lightLib := LightLibrary{}
 	resDir := ResourceDirectory{}
 	for _, isoFile := range files {
+		isoFile := isoFile // capture for the lazy re-read closure
 		data, err := isoFile.ReadAll(f)
 		if err != nil {
 			continue
@@ -453,7 +503,7 @@ func convertZoneISO(isoPath, outDir string) {
 				lightLib[id] = ld
 			}
 		}
-		for id, entry := range resourceDirFromData(data) {
+		for id, entry := range resourceDirFromData(data, func() ([]byte, error) { return isoFile.ReadAll(f) }) {
 			if _, exists := resDir[id]; !exists {
 				resDir[id] = entry
 			}
@@ -470,7 +520,7 @@ func convertZoneISO(isoPath, outDir string) {
 			bar.Add(1)
 			continue
 		}
-		n := convertZoneESFData(data, shortName, outDir, false, lib, lightLib, resDir)
+		n := convertZoneESFData(data, shortName, outDir, false, lib, lightLib, resDir, nil)
 		totalZones += n
 		bar.Add(1)
 	}
@@ -481,7 +531,8 @@ func convertZoneISO(isoPath, outDir string) {
 type zoneManifestEntry struct {
 	Index       int        `json:"index"`
 	GLB         string     `json:"glb"`
-	Name        string     `json:"name,omitempty"` // in-game area name from map tile data
+	Collision   string     `json:"collision,omitempty"` // sidecar collision GLB, if any
+	Name        string     `json:"name,omitempty"`      // in-game area name from map tile data
 	SpriteCount int        `json:"sprite_count"`
 	MinPos      [3]float32 `json:"min_pos,omitempty"`
 	MaxPos      [3]float32 `json:"max_pos,omitempty"`
@@ -530,7 +581,7 @@ func buildGlobalSurfacePool(objects []*eqoa.ESFObject, r io.ReadSeeker, order bi
 // resDir is the cross-file resource directory (0x9000 ResourceTable union) used
 // to resolve ZoneActor DictIDs the local sprite scan misses; pass nil to disable.
 // Returns the number of zone GLBs written.
-func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, lib SpriteLibrary, lightLib LightLibrary, resDir ResourceDirectory) int {
+func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, lib SpriteLibrary, lightLib LightLibrary, resDir ResourceDirectory, registry *eqoa.SurfaceRegistry) int {
 	var esfReader io.ReadSeeker
 
 	if len(data) >= 4 && string(data[:4]) == eqoa.MagicCESF {
@@ -888,6 +939,18 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 
 		spriteCount := 0
 
+		// World-space collision accumulated from placed animated-sprite instances
+		// (their own 0x4200 buffers, transformed by the actor matrix). The
+		// zone-tree collision walk skips these sprite subtrees, so this is the sole
+		// source of their collision — emitted per instance. Declared here so it
+		// survives past the ZoneActors block to the collision-emit site below.
+		var spriteCollPos [][3]float32
+		var spriteCollTris []uint32
+
+		// Cache of embedded particle-sprite textures (keyed by texture dictID) so a
+		// shared effect texture is embedded once, not once per emitter instance.
+		particleTexCache := map[uint32]int{}
+
 		// --- ZoneActors: place non-terrain sprites (trees, rocks, props) ---
 		if zoneActorsObj != nil {
 			// Index non-terrain sprites from ZoneResources by dictID (fallback for
@@ -921,7 +984,7 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 			resObjCache := map[uint32]*eqoa.ESFObject{}
 
 			// DEBUG (ZONE_ACTOR_DEBUG=1): instrument actor resolution.
-			var actTotal, actLocal, actLib, actDir, actLight, actEmpty, actSkip, actPlaceholder int
+			var actTotal, actLocal, actLib, actDir, actLight, actEmpty, actSkip, actPlaceholder, actParticle int
 			unresolved := map[uint32]int{}
 
 			// Walk the ZoneActors tree (0x3290→0x3270→0x6040→0x6000) and place sprites.
@@ -989,24 +1052,32 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 						if entry, ok := resDir[o.DictID]; ok {
 							obj, cached := resObjCache[o.DictID]
 							if !cached {
-								if parsed, err := eqoa.ReadObjectAt(entry.r, entry.order, int64(entry.ref.Offset)); err == nil {
-									// Integrity check: the directory records the full
-									// target object size (12-byte header + body), so a
-									// correctly-aligned offset must satisfy
-									// ObjectSize+12 == ref.Size. A mismatch means a bad
-									// offset (misaligned/corrupt) — skip rather than feed
-									// garbage to LoadAsset.
-									if entry.ref.Size == 0 || uint32(parsed.Header.ObjectSize)+uint32(eqoa.ObjectHeaderSize) == entry.ref.Size {
-										obj = parsed
+								// Materialize the file's decompressed stream lazily —
+								// only files actually referenced here are decompressed.
+								if r, rerr := entry.src.reader(); rerr == nil {
+									if parsed, err := eqoa.ReadObjectAt(r, entry.order, int64(entry.ref.Offset)); err == nil {
+										// Integrity check: the directory records the full
+										// target object size (12-byte header + body), so a
+										// correctly-aligned offset must satisfy
+										// ObjectSize+12 == ref.Size. A mismatch means a bad
+										// offset (misaligned/corrupt) — skip rather than feed
+										// garbage to LoadAsset.
+										if entry.ref.Size == 0 || uint32(parsed.Header.ObjectSize)+uint32(eqoa.ObjectHeaderSize) == entry.ref.Size {
+											obj = parsed
+										}
 									}
 								}
 								resObjCache[o.DictID] = obj
 							}
 							if obj != nil {
-								sprObj = obj
-								sprR = entry.r
-								sprOrder = entry.order
-								viaDir = true
+								// A fresh reader over the (now-cached) source bytes for
+								// the subsequent LoadSpriteMaterials/LoadAsset reads.
+								if r, rerr := entry.src.reader(); rerr == nil {
+									sprObj = obj
+									sprR = r
+									sprOrder = entry.order
+									viaDir = true
+								}
 							}
 						}
 					}
@@ -1055,6 +1126,16 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 
 					asset, err := eqoa.LoadAsset(sprR, sprObj, sprOrder)
 					if err != nil || len(asset.Meshes) == 0 {
+						// Particle/effect emitters (0xC100) have no mesh — the client
+						// spawns particles at runtime. Export them as tagged emitter
+						// markers carrying the decoded effect parameters.
+						if uint16(sprObj.Header.ObjectType) == 0xC100 {
+							if placeParticleEmitter(za, sprR, sprObj, sprOrder, o.DictID, pos, particleTexCache) {
+								actParticle++
+								spriteCount++
+								return
+							}
+						}
 						actEmpty++
 						return
 					}
@@ -1066,7 +1147,72 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 					default:
 						actLocal++
 					}
-					za.AddSpriteAtWorldPos(asset, pos, rot, scale, matStart)
+					// Animated/hierarchical props (clockwork, banners, …) are
+					// emitted as their own skinned+animated subtree so their
+					// animation survives; static props are baked into the flat
+					// zone mesh. Fall back to baking if the subtree export fails.
+					if len(asset.Actions) > 0 {
+						if err := za.AddAnimatedSpriteNode(sprR, asset, sprOrder, registry, pos, rot, scale); err != nil {
+							za.AddSpriteAtWorldPos(asset, pos, rot, scale, matStart)
+						}
+					} else {
+						za.AddSpriteAtWorldPos(asset, pos, rot, scale, matStart)
+					}
+					// Every placed sprite (animated OR static) carries its collision
+					// in its own local frame; the zone-tree walk skips placeable
+					// sprite subtrees, so emit a per-instance copy transformed by this
+					// actor's world placement. Without this, sprite collision piles up
+					// at the sprite's local origin (a stack of hulls at one point).
+					if collisionExport {
+						cp, ct := collectSpriteCollision(sprR, sprObj, sprOrder, pos, rot, scale)
+						if len(cp) > 0 {
+							offs := uint32(len(spriteCollPos))
+							spriteCollPos = append(spriteCollPos, cp...)
+							for _, idx := range ct {
+								spriteCollTris = append(spriteCollTris, offs+idx)
+							}
+						}
+					}
+					// Nested particle emitters (e.g. a wall-torch mesh with a child
+					// fire 0xC100): the sprite has geometry and is placed above, but
+					// its emitter child would otherwise be dropped. A GroupSprite
+					// (0x2C00) positions its members via a 0x2C30 transform array, so
+					// place each emitter at its member's local offset (the flame at
+					// the torch top) transformed into world space; other nestings fall
+					// back to the actor position.
+					if uint16(sprObj.Header.ObjectType) == 0x2C00 {
+						members := eqoa.ParseGroupMembers(sprObj, sprR, sprOrder)
+						if arr := eqoa.GroupSpriteArray(sprObj); arr != nil {
+							for i, child := range arr.Children {
+								if uint16(child.Header.ObjectType) != 0xC100 {
+									continue
+								}
+								wp := pos
+								if i < len(members) {
+									wp = actorWorldPoint(members[i].Pos, pos, rot, scale)
+								}
+								if placeParticleEmitter(za, sprR, child, sprOrder, child.DictID, wp, particleTexCache) {
+									actParticle++
+								}
+							}
+						}
+					} else {
+						var nestScan func(o *eqoa.ESFObject)
+						nestScan = func(o *eqoa.ESFObject) {
+							if uint16(o.Header.ObjectType) == 0xC100 {
+								if placeParticleEmitter(za, sprR, o, sprOrder, o.DictID, pos, particleTexCache) {
+									actParticle++
+								}
+								return
+							}
+							for _, c := range o.Children {
+								nestScan(c)
+							}
+						}
+						for _, c := range sprObj.Children {
+							nestScan(c)
+						}
+					}
 					spriteCount++
 					return
 				}
@@ -1077,8 +1223,8 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 			walkActors(zoneActorsObj)
 
 			if os.Getenv("ZONE_ACTOR_DEBUG") != "" && actTotal > 0 {
-				fmt.Fprintf(os.Stderr, "[%s zone %d] actors=%d placed(local=%d lib=%d dir=%d) lights=%d empty=%d skip=%d placeholder=%d\n",
-					sourceName, zoneIdx, actTotal, actLocal, actLib, actDir, actLight, actEmpty, actSkip, actPlaceholder)
+				fmt.Fprintf(os.Stderr, "[%s zone %d] actors=%d placed(local=%d lib=%d dir=%d) lights=%d particles=%d empty=%d skip=%d placeholder=%d\n",
+					sourceName, zoneIdx, actTotal, actLocal, actLib, actDir, actLight, actParticle, actEmpty, actSkip, actPlaceholder)
 				type mc struct {
 					id uint32
 					n  int
@@ -1104,17 +1250,34 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 		// Merge all accumulated per-material geometry into a single mesh.
 		za.FinalizeZoneMesh(fmt.Sprintf("zone-%d", zoneIdx))
 
-		// Opt-in: emit this zone's collision geometry (0x4200 CollBuffer) as a
-		// separate node tagged {"collision":true}. Kept out of the visual mesh so
-		// the default export is unchanged when --collision is absent.
+		// Collect this zone's collision geometry (0x4200 CollBuffer). It is
+		// written to a SEPARATE sidecar GLB (zone_N[_Area]_collision.glb) rather
+		// than baked into the visual mesh — standard game-pipeline practice that
+		// keeps the render asset clean in every viewer while preserving the data.
+		var collPos [][3]float32
+		var collTris []uint32
 		if collisionExport {
-			pos, tris, nColl := collectZoneCollision(esfReader, zoneObj, order)
-			if nColl > 0 {
-				za.Builder().AddCollisionNode("collision", pos, tris)
-				if verbose {
-					logf("  zone %d: collision %d verts / %d tris from %d CollBuffers\n",
-						zoneIdx, len(pos), len(tris)/3, nColl)
+			// Type-2 CollBuffer vertices are anchored to the zone's
+			// ZonePreTranslations (0x3250) pool by a per-vertex index; pass the
+			// full unfiltered array so they land on the rendered geometry.
+			collBase := make([][3]float32, len(allPTs))
+			for i, pt := range allPTs {
+				collBase[i] = [3]float32{pt.East, pt.HeightRef, pt.North}
+			}
+			pos, tris, nColl := collectZoneCollision(esfReader, zoneObj, order, collBase)
+			// Append the per-instance animated-sprite collision (already in world
+			// space) accumulated during actor placement.
+			if len(spriteCollPos) > 0 {
+				offs := uint32(len(pos))
+				pos = append(pos, spriteCollPos...)
+				for _, idx := range spriteCollTris {
+					tris = append(tris, offs+idx)
 				}
+			}
+			collPos, collTris = pos, tris
+			if verbose && len(tris) >= 3 {
+				logf("  zone %d: collision %d verts / %d tris (%d zone CollBuffers + %d sprite-instance verts)\n",
+					zoneIdx, len(pos), len(tris)/3, nColl, len(spriteCollPos))
 			}
 		}
 
@@ -1141,11 +1304,29 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 		za.Builder().WriteGLB(outF)
 		outF.Close()
 
+		// Collision sidecar: a separate GLB holding just the tagged collision
+		// mesh, so the visual GLB stays clean while the data is preserved.
+		collName := ""
+		if len(collTris) >= 3 {
+			cb := gltf.NewBuilder()
+			cb.AddCollisionNode("collision", collPos, collTris)
+			collName = strings.TrimSuffix(glbName, ".glb") + "_collision.glb"
+			if cf, cerr := os.Create(filepath.Join(zonesDir, collName)); cerr == nil {
+				cb.WriteGLB(cf)
+				cf.Close()
+			} else {
+				collName = ""
+			}
+		}
+
 		entry := zoneManifestEntry{
 			Index:       zoneIdx,
 			GLB:         filepath.Join("zones", glbName),
 			Name:        areaName,
 			SpriteCount: spriteCount,
+		}
+		if collName != "" {
+			entry.Collision = filepath.Join("zones", collName)
 		}
 		if za.HasPos() {
 			entry.MinPos = za.MinPos
@@ -1184,30 +1365,47 @@ func convertZoneESFData(data []byte, sourceName, outDir string, verbose bool, li
 // plus a flat triangle-list index buffer. Returns the merged positions, indices,
 // and the number of CollBuffers successfully decoded.
 //
-// The type-2 base-vertex table (the zone render-mesh pool) is not threaded in:
-// observed zone data uses baseIdx 0 throughout, so type-2 vertices decode exactly
-// with a zero base. See ParseCollBuffer for the documented best-effort behaviour.
-func collectZoneCollision(r io.ReadSeeker, zoneObj *eqoa.ESFObject, order binary.ByteOrder) ([][3]float32, []uint32, int) {
+// baseVerts is the zone's ZonePreTranslations (0x3250) array in (East, Height,
+// North) world space. Type-2 CollBuffer vertices are stored as a small i16 delta
+// plus an index k into this array (client: base = *(VIZone+0x78)[k], the same
+// pool ParseZonePreTranslations fills and ParseCollBuffer reads — verified in
+// ParseCollBuffer__10VIESFParse). Passing it aligns type-2 collision onto the
+// rendered geometry; passing nil leaves those vertices anchored at the origin.
+func collectZoneCollision(r io.ReadSeeker, zoneObj *eqoa.ESFObject, order binary.ByteOrder, baseVerts [][3]float32) ([][3]float32, []uint32, int) {
 	var positions [][3]float32
 	var indices []uint32
 	n := 0
 
 	var walk func(o *eqoa.ESFObject)
 	walk = func(o *eqoa.ESFObject) {
-		if uint16(o.Header.ObjectType) == 0x4200 {
+		t := uint16(o.Header.ObjectType)
+		// Placeable sprite subtrees (SimpleSprite/HSprite/CSprite and their
+		// animated variants) are positioned per actor-instance with a world
+		// transform; their collision is emitted from the actor path
+		// (collectSpriteCollision) so it lands on the placed visual. Skip them
+		// here — otherwise their sprite-local collision is dumped at raw
+		// definition coordinates (props piling at the origin, gears floating).
+		// Terrain SubSprites (0x2310) are NOT placeable: they sit directly under
+		// the zone and carry zone-anchored (type-2) collision, so they stay.
+		switch t {
+		case 0x2000, 0x2200, 0x2400, 0x2600, 0x2700, 0x2C00:
+			return
+		}
+		if t == 0x4200 {
 			body, err := o.ReadBody(r)
 			if err == nil {
-				cb, err := eqoa.ParseCollBuffer(body, order, int(o.Header.ObjectVersion), nil)
+				cb, err := eqoa.ParseCollBuffer(body, order, int(o.Header.ObjectVersion), baseVerts)
 				if err == nil && len(cb.Positions) > 0 {
 					base := uint32(len(positions))
-					// CollBuffer positions are absolute EQOA world space
-					// (x=East, y=Height, z=North). Apply the same axis remap the
-					// visual terrain uses (see ZoneAssembler.AddSpriteMeshes:
-					// GLB.X=East, GLB.Y=North, GLB.Z=-Height) so the collision node
-					// aligns with the rendered geometry. No pretranslation offset is
-					// added — collision coords already carry the world anchor.
+					// CollBuffer positions are EQOA world space (x=East,
+					// y=Height, z=North) — type-0/1 verts are absolute, type-2
+					// verts already have their ZonePreTranslations anchor folded
+					// in by ParseCollBuffer (see baseVerts). Emit directly as GLB
+					// (X=East, Y=Height, Z=North), the same Y-up frame the visual
+					// terrain uses (see ZoneAssembler.AddSpriteMeshes), so the
+					// collision node aligns with the rendered geometry.
 					for _, p := range cb.Positions {
-						positions = append(positions, [3]float32{p[0], p[2], -p[1]})
+						positions = append(positions, [3]float32{p[0], p[1], p[2]})
 					}
 					for _, idx := range cb.Triangles {
 						indices = append(indices, base+idx)
@@ -1225,8 +1423,126 @@ func collectZoneCollision(r io.ReadSeeker, zoneObj *eqoa.ESFObject, order binary
 	return positions, indices, n
 }
 
+// actorWorldPoint transforms a sprite-local point into world space by an actor's
+// placement — world = R(rot)·(scale·local) + pos — the same convention used to
+// place sprite meshes and collision. Used to lift a GroupSprite member's local
+// offset (e.g. a torch flame position) to its world location.
+func actorWorldPoint(local [3]float32, pos, rot [3]float32, scale float32) [3]float32 {
+	m := gltf.EulerRotMatrix(rot)
+	e, h, n := local[0]*scale, local[1]*scale, local[2]*scale
+	return [3]float32{
+		m[0]*e + m[1]*h + m[2]*n + pos[0],
+		m[3]*e + m[4]*h + m[5]*n + pos[1],
+		m[6]*e + m[7]*h + m[8]*n + pos[2],
+	}
+}
+
+// placeParticleEmitter decodes a placed 0xC100 ParticleSprite and adds a tagged
+// emitter marker at its world position. Returns false if the object isn't a
+// decodable particle emitter (so the caller can fall back to counting it empty).
+func placeParticleEmitter(za *gltf.ZoneAssembler, r io.ReadSeeker, obj *eqoa.ESFObject, order binary.ByteOrder, dictID uint32, pos [3]float32, texCache map[uint32]int) bool {
+	ps, err := eqoa.ParseParticleSprite(r, obj, order)
+	if err != nil || ps.Def == nil || len(ps.Def.Motifs) == 0 {
+		return false
+	}
+	// Nested (inline) emitters have no top-level dictID; identify them by their
+	// definition reference, then its texture, so they aren't all "0x00000000".
+	if dictID == 0 {
+		if ps.DefRef != 0 {
+			dictID = ps.DefRef
+		} else {
+			dictID = ps.Def.TextureDictID
+		}
+	}
+	// Embed the particle sprite texture once per unique texture and reference it
+	// from extras, so a runtime has the sprite image, not just its dictID.
+	texIdx := -1
+	if ps.Def.Texture != nil && texCache != nil {
+		if idx, ok := texCache[ps.Def.TextureDictID]; ok {
+			texIdx = idx
+		} else if img, ierr := ps.Def.Texture.ToImage(0); ierr == nil {
+			texIdx = za.Builder().AddImageTexture(img)
+			texCache[ps.Def.TextureDictID] = texIdx
+		}
+	}
+	m := ps.Def.Motifs[0]
+	clamp01 := func(f float32) float32 {
+		if f < 0 {
+			return 0
+		}
+		if f > 1 {
+			return 1
+		}
+		return f
+	}
+	rgb := [3]float32{clamp01(m.Gradient[0][0]), clamp01(m.Gradient[0][1]), clamp01(m.Gradient[0][2])}
+	size := m.StartSize
+	if size < 0.3 {
+		size = 0.3
+	}
+	if size > 1.5 {
+		size = 1.5
+	}
+	fields := map[string]any{
+		"effect":  "particle",
+		"dict_id": fmt.Sprintf("0x%08X", dictID),
+		"sprite":  ps,
+	}
+	if texIdx >= 0 {
+		fields["texture"] = texIdx // glTF texture index of the particle sprite
+	}
+	extras, err := json.Marshal(fields)
+	if err != nil {
+		return false
+	}
+	za.AddParticleEmitter(fmt.Sprintf("Emitter_0x%08X", dictID), pos, rgb, size, extras)
+	return true
+}
+
+// collectSpriteCollision decodes the 0x4200 CollBuffers nested under a single
+// placed sprite definition and returns them transformed into world space by the
+// actor's placement — world = R·(scale·v) + pos, the same transform
+// AddAnimatedSpriteNode/AddSpriteAtWorldPos apply to the visual mesh. baseVerts
+// is nil: a sprite's own collision is absolute in its local frame (type-0/1), not
+// anchored to the zone's ZonePreTranslations pool. Indices are offset by base so
+// the returned buffers can be concatenated with other collision geometry.
+func collectSpriteCollision(r io.ReadSeeker, sprObj *eqoa.ESFObject, order binary.ByteOrder, pos, rot [3]float32, scale float32) ([][3]float32, []uint32) {
+	m := gltf.EulerRotMatrix(rot)
+	var positions [][3]float32
+	var indices []uint32
+	var walk func(o *eqoa.ESFObject)
+	walk = func(o *eqoa.ESFObject) {
+		if uint16(o.Header.ObjectType) == 0x4200 {
+			body, err := o.ReadBody(r)
+			if err == nil {
+				cb, err := eqoa.ParseCollBuffer(body, order, int(o.Header.ObjectVersion), nil)
+				if err == nil && len(cb.Positions) > 0 {
+					base := uint32(len(positions))
+					for _, p := range cb.Positions {
+						e, h, n := p[0]*scale, p[1]*scale, p[2]*scale
+						positions = append(positions, [3]float32{
+							m[0]*e + m[1]*h + m[2]*n + pos[0],
+							m[3]*e + m[4]*h + m[5]*n + pos[1],
+							m[6]*e + m[7]*h + m[8]*n + pos[2],
+						})
+					}
+					for _, idx := range cb.Triangles {
+						indices = append(indices, base+idx)
+					}
+				}
+			}
+			return
+		}
+		for _, c := range o.Children {
+			walk(c)
+		}
+	}
+	walk(sprObj)
+	return positions, indices
+}
+
 func init() {
 	convertZoneCmd.Flags().StringVarP(&outputDir, "output", "o", "", "Output directory for assembled zone GLBs (default: current directory)")
-	convertZoneCmd.Flags().BoolVar(&collisionExport, "collision", false, "Also export zone collision geometry (0x4200 CollBuffer) as a separate 'collision' glTF node (default off)")
-	rootCmd.AddCommand(convertZoneCmd)
+	convertZoneCmd.Flags().BoolVar(&collisionExport, "collision", true, "export zone collision geometry (0x4200 CollBuffer) as a tagged 'collision' node (on by default; --collision=false to omit)")
+	devCmd.AddCommand(convertZoneCmd)
 }

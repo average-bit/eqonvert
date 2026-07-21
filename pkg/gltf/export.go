@@ -594,7 +594,23 @@ func exportAnimations(b *Builder, asset *eqoa.Asset, jointNodeIndices []int) {
 	pairSpecs := map[int][]animChanSpec{}
 	pairName := map[int]string{}
 	var pairOrder []int
-	var layerClips []Animation
+	// Layer clips are held with their pair index and emitted after the merged
+	// clips — but only for pairs that actually have TWO contributing layers. When
+	// one half of a pair is empty (e.g. a prop whose action has only a "lower"
+	// layer — clockwork gears, banners), the merged clip is byte-identical to the
+	// lone layer, and emitting both leaves two identical animations targeting the
+	// same joints. A viewer that plays every clip in a zone GLB then applies both,
+	// compounding each member's rotate-about-center translation (T = C − R·C) and
+	// flinging it off its axle — the "warped gear/clock-hand" artifact. Skipping
+	// the redundant duplicate is safe: the merged clip already carries it.
+	type layerClip struct {
+		pair int
+		anim Animation
+	}
+	var layerClips []layerClip
+	pairLayers := map[int]int{}
+	// Joints whose default (not-playing) pose has already been set from frame 0.
+	posed := map[int]bool{}
 
 	for ai, aSet := range asset.Actions {
 		nFrames := int(aSet.NumFrames)
@@ -650,6 +666,21 @@ func exportAnimations(b *Builder, asset *eqoa.Asset, jointNodeIndices []int) {
 			}
 			nodeIdx := jointNodeIndices[jointIdx]
 
+			// Bake frame 0 into the joint's DEFAULT (not-playing) pose. EQOA idle
+			// clips carry member placement in their keyframes — the bind pose has
+			// members unplaced (a banner's mount joint is at origin; frame 0 lifts
+			// it onto the wall). A glTF viewer plays one clip at a time, so in a
+			// multi-animation zone every other animated prop would otherwise show
+			// its unplaced bind pose (banners/windmill parts hanging below the
+			// structure). The animation still overrides this when it plays.
+			if !posed[nodeIdx] && len(ch.Frames) > 0 {
+				posed[nodeIdx] = true
+				q := quatNorm(ch.Frames[0].Rotation)
+				b.Doc.Nodes[nodeIdx].Rotation = q
+				p := ch.Frames[0].Position
+				b.Doc.Nodes[nodeIdx].Translation = []float32{p[0], p[1], p[2]}
+			}
+
 			// Rotation (VEC4 quaternion XYZW, normalized) + translation outputs.
 			rotBuf := new(bytes.Buffer)
 			posBuf := new(bytes.Buffer)
@@ -673,10 +704,6 @@ func exportAnimations(b *Builder, asset *eqoa.Asset, jointNodeIndices []int) {
 		if len(specs) == 0 {
 			continue
 		}
-		// Hold this half as a standalone "layer" clip (appended after merged).
-		layerClips = append(layerClips,
-			buildAnimation(animationName(ai, aSet.DictID, includesRoot), specs))
-
 		// Accumulate the pair's channels for the merged full-body clip.
 		pairIdx := ai / 2
 		if _, seen := pairSpecs[pairIdx]; !seen {
@@ -684,15 +711,28 @@ func exportAnimations(b *Builder, asset *eqoa.Asset, jointNodeIndices []int) {
 			pairName[pairIdx] = mergedAnimationName(pairIdx, aSet.DictID)
 		}
 		pairSpecs[pairIdx] = append(pairSpecs[pairIdx], specs...)
+		pairLayers[pairIdx]++
+
+		// Hold this half as a standalone "layer" clip (appended after merged, and
+		// only if its pair ends up with two real layers — see pairLayers below).
+		layerClips = append(layerClips, layerClip{
+			pair: pairIdx,
+			anim: buildAnimation(animationName(ai, aSet.DictID, includesRoot), specs),
+		})
 	}
 
 	// Merged full-body clips first (so animation[0] is a correct composited
-	// pose), then the individual upper/lower layers.
+	// pose), then the individual upper/lower layers — but only for pairs that
+	// genuinely have two layers, so a single-layer action isn't duplicated.
 	for _, pi := range pairOrder {
 		b.Doc.Animations = append(b.Doc.Animations,
 			buildAnimation(pairName[pi], pairSpecs[pi]))
 	}
-	b.Doc.Animations = append(b.Doc.Animations, layerClips...)
+	for _, lc := range layerClips {
+		if pairLayers[lc.pair] >= 2 {
+			b.Doc.Animations = append(b.Doc.Animations, lc.anim)
+		}
+	}
 }
 
 func ptrInt(i int) *int { return &i }

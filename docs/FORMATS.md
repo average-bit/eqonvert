@@ -79,7 +79,7 @@ families:
 | 0x3000–0x32xx | Zone structures: rooms, terrain tables, actors |
 | 0x4200 | Collision mesh |
 | 0xB000–0xB1xx | Audio (PS2 ADPCM, XM modules) |
-| 0xC000–0xC3xx | Particles and spell effects (not yet parsed) |
+| 0xC000–0xC3xx | Particle / effect emitters (see [Particle emitters](#particle-emitters)) |
 
 ### Sprite containers
 
@@ -213,3 +213,51 @@ Zone object and re-centers it; `reader scene` dumps actor placements to JSON.
    transforms are. Validate skeletons with *animated* poses. This masked a
    major bug in this tool for weeks — see
    [ANIMATION.md](ANIMATION.md#trap-2-the-skeleton-stores-world-space-transforms).
+
+## Particle emitters
+
+Fires, cascading water, smoke and spell effects are runtime particle systems,
+not geometry. On disc:
+
+```
+0xC100 ParticleSprite
+  0xC101 header            u32 definition dictID
+  0xC000 ParticleDefinition (NumberOfSubObjects is a format flag, not a count)
+    0xC010                 u32 texture dictID
+    0x1000 Surface         the particle sprite image
+    0xC020                 flat parameter block:
+                           u32 textureDictID, i32 blendMode, i32 zWrite,
+                           i32 zTest, i32 textureConfig, i32 motifCount-1,
+                           then per motif (name[32] for motif>0):
+                             13× f32 friction, birthrate(+var), lifespan(+var),
+                                 velocity(+var), startSize(+var), endSize(+var),
+                                 inheritVelocity, deltaSpawn
+                             2× RGBA startColorVar, endColorVar
+                             32× RGBA gradient (colour over life)
+                             f32 gradientRepeat
+                             6× vec3 inner/outer offset+hpr, nozzle axis+hpr
+                             i32 gravityOn (ObjectVersion ≥ 1 only)
+```
+
+Emitters nested in a `GroupSprite` (0x2C00) — e.g. a wall-torch flame — are
+positioned by the group's 0x2C30 member array: per member
+`[u32 dictID, vec3 rot, f32 scale, vec3 pos]`, index-aligned with the 0x2C20
+sprite array; local matrix `T(pos)·R_euler(rot)·S(scale)`.
+
+### Export representation (glTF)
+
+glTF has no particle system, so eqonvert emits each emitter as an `Emitter_<id>`
+node — a small octahedron marker tinted with the effect's start colour — at the
+emitter's world position, with the full recipe on the node `extras`:
+
+```jsonc
+{
+  "effect": "particle",
+  "dict_id": "0x19E16B19",
+  "texture": 120,            // glTF texture index of the particle sprite
+  "sprite": { "def_ref": 0, "definition": { /* full ParticleDefinition */ } }
+}
+```
+
+A consuming runtime recreates the live effect from `extras` + the referenced
+texture; a plain glTF viewer just shows the marker.

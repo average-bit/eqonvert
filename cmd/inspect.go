@@ -57,7 +57,7 @@ var inspectCmd = &cobra.Command{
 
 func init() {
 	inspectCmd.Flags().BoolVar(&inspectJSON, "json", false, "emit the object tree as JSON")
-	rootCmd.AddCommand(inspectCmd)
+	devCmd.AddCommand(inspectCmd)
 }
 
 // objNode is the JSON shape of one ESF object (with --json).

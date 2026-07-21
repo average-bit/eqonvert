@@ -106,5 +106,5 @@ func writeAssetIndex(base string) error {
 }
 
 func init() {
-	rootCmd.AddCommand(indexCmd)
+	devCmd.AddCommand(indexCmd)
 }

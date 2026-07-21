@@ -23,13 +23,6 @@ convert without them). Run 'eqonvert --version' to see detected tool versions.`,
 	},
 }
 
-// advancedCommands are the research/dev subcommands. They still work when
-// invoked directly, but are hidden from --help so end users see just `convert`.
-var advancedCommands = []string{
-	"convert-zone", "decompress", "dump-body", "extract",
-	"index", "inspect", "scene",
-}
-
 // verbose/quiet are global output-verbosity flags honored by logf / vlogf.
 var (
 	verbose bool
@@ -51,16 +44,10 @@ func Execute(version string) {
 	if versionRequested() {
 		rootCmd.SetVersionTemplate("eqonvert {{.Version}}\n\n" + externalToolsReport() + "\n")
 	}
-	// Keep the help surface minimal: hide the shell-completion command and the
-	// advanced/research subcommands (they remain fully functional if called).
+	// Keep the help surface minimal: the research/dev subcommands live under
+	// `eqonvert dev`, so the top level shows just `convert` (+ `dev`). Hide the
+	// generated shell-completion command too.
 	rootCmd.CompletionOptions.HiddenDefaultCmd = true
-	for _, c := range rootCmd.Commands() {
-		for _, name := range advancedCommands {
-			if c.Name() == name {
-				c.Hidden = true
-			}
-		}
-	}
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1) // cobra has already printed the error to stderr
 	}

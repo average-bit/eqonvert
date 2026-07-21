@@ -60,7 +60,7 @@ var extractCmd = &cobra.Command{
 }
 
 func init() {
-	rootCmd.AddCommand(extractCmd)
+	devCmd.AddCommand(extractCmd)
 }
 
 func extractRecursive(r io.ReadSeeker, obj *eqoa.ESFObject, order binary.ByteOrder, dir string) {

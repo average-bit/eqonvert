@@ -24,6 +24,9 @@ var (
 var worldCmd = &cobra.Command{
 	Use:   "world <path>",
 	Short: "Build a navigable SQLite world database of zones, placements and models",
+	// Hidden until the world-DB build is finalized (schema still settling); the
+	// command works but isn't advertised in top-level help yet.
+	Hidden: true,
 	Long: `Extract every zone's actor placements (full 7-DOF) into a single SQLite
 database, organised region → zone → placement → model, with a zone-adjacency
 graph. Accepts a directory, a disc image (.iso), or a single .esf/.csf file.

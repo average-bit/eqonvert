@@ -3,6 +3,7 @@ package gltf
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"image/png"
 	"io"
@@ -97,11 +98,18 @@ func (za *ZoneAssembler) SetFallbackSurfaces(pool map[uint32]*eqoa.Surface) {
 	za.fallbackSurfaces = pool
 }
 
-// accVertex holds one vertex in world-space GLB coordinates (X=east, Y=north, Z=-height).
+// accVertex holds one vertex in world-space GLB coordinates (X=east, Y=height, Z=north).
+// This is Y-up (Height on Y), matching the single-model export convention so
+// zones and character/item models share one world frame.
 type accVertex struct {
 	pos    [3]float32
 	uv     [2]float32
 	normal [3]float32
+	// weld marks a vertex as eligible for seam welding. Terrain sub-block
+	// vertices set this (their sub-block boundaries need closing); placed props
+	// set it false so their self-contained, finely-detailed geometry is never
+	// collapsed by the terrain-tuned weld distance.
+	weld bool
 }
 
 // mergedGeom holds accumulated geometry for a single material across all sprites.
@@ -404,8 +412,8 @@ func ParseSpriteWorldOffset(r io.ReadSeeker, spriteObj *eqoa.ESFObject, order bi
 // Vertex Pos[] are local to the sub-block; world position:
 //
 //	GLB.X = Pos[0] + sbEast
-//	GLB.Y = Pos[2] + sbNorth
-//	GLB.Z = -(Pos[1] + sbHeight)
+//	GLB.Y = Pos[1] + sbHeight
+//	GLB.Z = Pos[2] + sbNorth
 //
 // matStart is the base GLTF material index for this sprite's face groups.
 // For terrain tiles: matStart = PaletteStart(subBlockIdx).
@@ -451,8 +459,8 @@ func (za *ZoneAssembler) AddSpriteMeshes(asset *eqoa.Asset, _ string, sbEast, sb
 				}
 				wp := [3]float32{
 					v.Pos[0] + east,
+					v.Pos[1] + height,
 					v.Pos[2] + north,
-					-(v.Pos[1] + height),
 				}
 				if !za.hasPos {
 					za.MinPos, za.MaxPos = wp, wp
@@ -470,7 +478,14 @@ func (za *ZoneAssembler) AddSpriteMeshes(asset *eqoa.Asset, _ string, sbEast, sb
 				mg.vertices = append(mg.vertices, accVertex{
 					pos:    wp,
 					uv:     v.UV,
-					normal: [3]float32{v.Normal[0], v.Normal[2], -v.Normal[1]},
+					normal: [3]float32{v.Normal[0], v.Normal[1], v.Normal[2]},
+					// Weld terrain only when the zone actually tiles MULTIPLE
+					// sub-blocks — seams exist between adjacent tiles, so a single
+					// tile (or none) has nothing to close. Structure zones like
+					// ARENA carry one pretranslation and no seams; welding there
+					// only snaps detailed prop geometry (clockwork, gears) together
+					// into a crumpled mess. A count > 1 is real tiling.
+					weld: len(za.preTranslations) > 1,
 				})
 			}
 			for _, idx := range fg.Indices {
@@ -497,6 +512,59 @@ func (za *ZoneAssembler) AddUnlitMaterial(name string, rgb [3]float32) int {
 		},
 	})
 	return idx
+}
+
+// AddParticleEmitter marks a particle/effect emitter (ESF 0xC100) at an EQOA
+// world position. glTF has no particle system, so the emitter is exported as a
+// small octahedron marker — unlit and tinted with the effect's start colour so
+// fire reads orange, water blue, smoke grey — with the full decoded parameters
+// attached to the node's `extras` for a downstream tool to recreate the live
+// effect. size is the marker half-extent (world units). pos = (East, Height,
+// North), emitted directly as Y-up GLB.
+func (za *ZoneAssembler) AddParticleEmitter(name string, pos [3]float32, rgb [3]float32, size float32, extras json.RawMessage) {
+	matIdx := za.AddUnlitMaterial(name, rgb)
+
+	// Octahedron vertices (±size on each axis), translated to pos.
+	local := [6][3]float32{
+		{+size, 0, 0}, {-size, 0, 0}, {0, +size, 0}, {0, -size, 0}, {0, 0, +size}, {0, 0, -size},
+	}
+	posBuf := new(bytes.Buffer)
+	minv := [3]float32{pos[0] - size, pos[1] - size, pos[2] - size}
+	maxv := [3]float32{pos[0] + size, pos[1] + size, pos[2] + size}
+	for _, v := range local {
+		binary.Write(posBuf, binary.LittleEndian, [3]float32{v[0] + pos[0], v[1] + pos[1], v[2] + pos[2]})
+	}
+	posBv := za.b.AddBufferView(posBuf.Bytes(), 34962)
+	posAcc := za.b.AddAccessor(posBv, 0, 5126, 6, "VEC3", false)
+	za.b.Doc.Accessors[posAcc].Min = minv[:]
+	za.b.Doc.Accessors[posAcc].Max = maxv[:]
+
+	idxBuf := new(bytes.Buffer)
+	for _, i := range []uint16{0, 2, 4, 2, 1, 4, 1, 3, 4, 3, 0, 4, 2, 0, 5, 1, 2, 5, 3, 1, 5, 0, 3, 5} {
+		binary.Write(idxBuf, binary.LittleEndian, i)
+	}
+	idxBv := za.b.AddBufferView(idxBuf.Bytes(), 34963)
+	idxAcc := za.b.AddAccessor(idxBv, 0, 5123, 24, "SCALAR", false)
+
+	meshIdx := za.b.AddMesh(Mesh{
+		Name:       name,
+		Primitives: []Primitive{{Attributes: map[string]int{"POSITION": posAcc}, Indices: &idxAcc, Material: &matIdx}},
+	})
+	nodeIdx := za.b.AddNode(Node{Name: name, Mesh: &meshIdx, Extras: extras})
+	za.b.AddSceneNode(nodeIdx)
+
+	if !za.hasPos {
+		za.MinPos, za.MaxPos, za.hasPos = pos, pos, true
+	} else {
+		for k := 0; k < 3; k++ {
+			if pos[k] < za.MinPos[k] {
+				za.MinPos[k] = pos[k]
+			}
+			if pos[k] > za.MaxPos[k] {
+				za.MaxPos[k] = pos[k]
+			}
+		}
+	}
 }
 
 // AddSpriteAtWorldPos places a non-terrain sprite at an absolute EQOA world position.
@@ -555,13 +623,14 @@ func (za *ZoneAssembler) AddSpriteAtWorldPos(asset *eqoa.Asset, pos [3]float32, 
 				le := v.Pos[0] * scale
 				lh := v.Pos[1] * scale
 				ln := v.Pos[2] * scale
-				// Rotate by the full Euler matrix, then map EQOA
-				// (East,Height,North) → glTF (East,North,-Height).
+				// Rotate by the full Euler matrix. EQOA (East,Height,North)
+				// is emitted directly as glTF (East,Height,North) — Y-up,
+				// matching the model export.
 				re, rh, rn := rotVec(le, lh, ln)
 				wp := [3]float32{
 					re + pos[0],
+					rh + pos[1],
 					rn + pos[2],
-					-(rh + pos[1]),
 				}
 				if !za.hasPos {
 					za.MinPos, za.MaxPos = wp, wp
@@ -580,7 +649,11 @@ func (za *ZoneAssembler) AddSpriteAtWorldPos(asset *eqoa.Asset, pos [3]float32, 
 				mg.vertices = append(mg.vertices, accVertex{
 					pos:    wp,
 					uv:     v.UV,
-					normal: [3]float32{ne, nn, -nh},
+					normal: [3]float32{ne, nh, nn},
+					// Placed props are self-contained sprites with no sub-block
+					// seams — welding them (esp. detailed props like clockwork
+					// gears, spaced ~0.3u) collapses their geometry. Never weld.
+					weld: false,
 				})
 			}
 			for _, idx := range fg.Indices {
@@ -590,16 +663,120 @@ func (za *ZoneAssembler) AddSpriteAtWorldPos(asset *eqoa.Asset, pos [3]float32, 
 	}
 }
 
+// EulerRotMatrix builds the row-major 3×3 rotation for EQOA actor euler angles
+// rot = [yaw about Height(Y), pitch about East(X), roll about North(Z)],
+// composed R = Ryaw·Rpitch·Rroll — the same convention AddSpriteAtWorldPos bakes.
+// Exported so callers can transform a sprite's collision geometry by the same
+// actor placement the visual mesh receives (see cmd collectSpriteCollision).
+func EulerRotMatrix(rot [3]float32) [9]float32 {
+	cy := float32(math.Cos(float64(rot[0])))
+	sy := float32(math.Sin(float64(rot[0])))
+	cp := float32(math.Cos(float64(rot[1])))
+	sp := float32(math.Sin(float64(rot[1])))
+	cr := float32(math.Cos(float64(rot[2])))
+	sr := float32(math.Sin(float64(rot[2])))
+	return [9]float32{
+		cy*cr - sy*sp*sr, -cy*sr - sy*sp*cr, -sy * cp,
+		cp * sr, cp * cr, -sp,
+		sy*cr + cy*sp*sr, -sy*sr + cy*sp*cr, cy * cp,
+	}
+}
+
+// mat3ToQuat converts a row-major 3×3 rotation matrix (as produced by
+// EulerRotMatrix) to a normalized glTF quaternion [x, y, z, w]. Uses the stable
+// trace/largest-diagonal branch method so no axis blows up near 180°.
+func mat3ToQuat(m [9]float32) []float32 {
+	// m indices: [0 1 2 / 3 4 5 / 6 7 8] = R[row][col].
+	m00, m01, m02 := float64(m[0]), float64(m[1]), float64(m[2])
+	m10, m11, m12 := float64(m[3]), float64(m[4]), float64(m[5])
+	m20, m21, m22 := float64(m[6]), float64(m[7]), float64(m[8])
+	tr := m00 + m11 + m22
+	var x, y, z, w float64
+	switch {
+	case tr > 0:
+		s := math.Sqrt(tr+1.0) * 2 // s = 4w
+		w = 0.25 * s
+		x = (m21 - m12) / s
+		y = (m02 - m20) / s
+		z = (m10 - m01) / s
+	case m00 > m11 && m00 > m22:
+		s := math.Sqrt(1.0+m00-m11-m22) * 2 // s = 4x
+		w = (m21 - m12) / s
+		x = 0.25 * s
+		y = (m01 + m10) / s
+		z = (m02 + m20) / s
+	case m11 > m22:
+		s := math.Sqrt(1.0+m11-m00-m22) * 2 // s = 4y
+		w = (m02 - m20) / s
+		x = (m01 + m10) / s
+		y = 0.25 * s
+		z = (m12 + m21) / s
+	default:
+		s := math.Sqrt(1.0+m22-m00-m11) * 2 // s = 4z
+		w = (m10 - m01) / s
+		x = (m02 + m20) / s
+		y = (m12 + m21) / s
+		z = 0.25 * s
+	}
+	n := math.Sqrt(x*x + y*y + z*z + w*w)
+	if n == 0 {
+		return []float32{0, 0, 0, 1}
+	}
+	return []float32{float32(x / n), float32(y / n), float32(z / n), float32(w / n)}
+}
+
+// AddAnimatedSpriteNode places an animated/hierarchical sprite as its own
+// skinned+animated glTF subtree (preserving its skeleton and animation clips),
+// parented under a node carrying the actor's world transform — instead of baking
+// it into the flat zone mesh. This keeps the historical animation (e.g. a
+// spinning clockwork) alive and avoids the frozen/wrong rest-pose look that
+// baking produces. Static geometry still goes through AddSpriteAtWorldPos.
+func (za *ZoneAssembler) AddAnimatedSpriteNode(r io.ReadSeeker, asset *eqoa.Asset, order binary.ByteOrder, registry *eqoa.SurfaceRegistry, pos [3]float32, rot [3]float32, scale float32) error {
+	rootIdx, err := ExportAssetToBuilder(za.b, r, asset, order, registry, false)
+	if err != nil {
+		return err
+	}
+	// Place the subtree at the actor's world transform as explicit TRS, not a
+	// baked matrix. The root anchors a skin/skeleton, and glTF viewers commonly
+	// mis-decompose a `matrix` on such a node (uniform scale + a rotation whose
+	// columns carry negative entries), shearing the whole skinned hierarchy —
+	// which is exactly the clockwork "warp" seen only once the sprite is placed
+	// in a zone (the un-transformed standalone export renders correctly). TRS is
+	// decomposition-free, so the skin resolves cleanly. The root is not
+	// animation-targeted (only its joint children are), so plain TRS is legal.
+	n := &za.b.Doc.Nodes[rootIdx]
+	n.Matrix = nil
+	n.Translation = []float32{pos[0], pos[1], pos[2]}
+	n.Rotation = mat3ToQuat(EulerRotMatrix(rot))
+	n.Scale = []float32{scale, scale, scale}
+	za.b.AddSceneNode(rootIdx)
+
+	// Extend the zone bbox by the actor position (the sprite is small vs a zone).
+	if !za.hasPos {
+		za.MinPos, za.MaxPos, za.hasPos = pos, pos, true
+	} else {
+		for k := 0; k < 3; k++ {
+			if pos[k] < za.MinPos[k] {
+				za.MinPos[k] = pos[k]
+			}
+			if pos[k] > za.MaxPos[k] {
+				za.MaxPos[k] = pos[k]
+			}
+		}
+	}
+	return nil
+}
+
 // zoneLightIntensity is the KHR_lights_punctual intensity (candela) given to
 // recovered zone point lights. The 0x2b00 defs carry only color + radius, not
 // intensity, so this is a fixed, tunable value chosen to read well in viewers.
-const zoneLightIntensity = 130.0
+const zoneLightIntensity = 22.5
 
 // AddPointLight places a KHR_lights_punctual point light at EQOA world position
-// pos = [East, Height, North], converting to GLB space [East, North, -Height].
+// pos = [East, Height, North], emitted directly as GLB [East, Height, North] (Y-up).
 // color is linear RGB in [0,1]; radius (world units) becomes the light range.
 func (za *ZoneAssembler) AddPointLight(name string, pos [3]float32, color [3]float32, radius float32) {
-	wp := [3]float32{pos[0], pos[2], -pos[1]}
+	wp := [3]float32{pos[0], pos[1], pos[2]}
 	li := za.b.AddPointLight(name, color, zoneLightIntensity, radius)
 	za.b.AddLightNode(name, wp, li)
 	if !za.hasPos {
@@ -635,6 +812,13 @@ func weldVertices(verts []accVertex, indices []uint32) ([]accVertex, []uint32) {
 	keyToCanon := make(map[key3]uint32, len(verts))
 
 	for i, v := range verts {
+		// Non-weldable vertices (placed props) always get a unique slot — never
+		// merged with each other or with terrain — so their fine detail survives.
+		if !v.weld {
+			remap[i] = uint32(len(canonical))
+			canonical = append(canonical, i)
+			continue
+		}
 		k := key3{
 			int32(math.Round(float64(v.pos[0] * scale))),
 			int32(math.Round(float64(v.pos[1] * scale))),
@@ -732,10 +916,19 @@ func (za *ZoneAssembler) FinalizeZoneMesh(name string) {
 		bvIdx = za.b.AddBufferView(uvData.Bytes(), 34962)
 		prim.Attributes["TEXCOORD_0"] = za.b.AddAccessor(bvIdx, 0, 5126, len(mg.vertices), "VEC2", false)
 
-		// NORMAL
+		// NORMAL — emit unit-length normals; a few source verts carry a zero
+		// normal (degenerate source quads) which glTF rejects, so normalize and
+		// fall back to +Y (up) for zero-length ones.
 		normData := new(bytes.Buffer)
 		for _, av := range mg.vertices {
-			binary.Write(normData, binary.LittleEndian, av.normal)
+			n := av.normal
+			l := float32(math.Sqrt(float64(n[0]*n[0] + n[1]*n[1] + n[2]*n[2])))
+			if l < 1e-6 {
+				n = [3]float32{0, 1, 0}
+			} else {
+				n = [3]float32{n[0] / l, n[1] / l, n[2] / l}
+			}
+			binary.Write(normData, binary.LittleEndian, n)
 		}
 		bvIdx = za.b.AddBufferView(normData.Bytes(), 34962)
 		prim.Attributes["NORMAL"] = za.b.AddAccessor(bvIdx, 0, 5126, len(mg.vertices), "VEC3", false)

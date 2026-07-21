@@ -59,7 +59,7 @@ var decompressCmd = &cobra.Command{
 }
 
 func init() {
-	rootCmd.AddCommand(decompressCmd)
+	devCmd.AddCommand(decompressCmd)
 }
 
 // decompressFile decompresses one CSF into an ESF at outPath.

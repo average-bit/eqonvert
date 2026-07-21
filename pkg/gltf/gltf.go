@@ -93,6 +93,11 @@ type Node struct {
 	Translation []float32       `json:"translation,omitempty"`
 	Rotation    []float32       `json:"rotation,omitempty"`
 	Scale       []float32       `json:"scale,omitempty"`
+	// Matrix is a column-major 4×4 transform, an alternative to TRS. Used to
+	// place an animated sprite subtree at an actor's world transform without
+	// re-deriving a quaternion. Must not coexist with TRS on the same node, and
+	// the node must not be animation-targeted (only its joint children are).
+	Matrix      []float32       `json:"matrix,omitempty"`
 	Extensions  *NodeExtensions `json:"extensions,omitempty"`
 	// Extras is the glTF-sanctioned carrier for application-specific data
 	// (ignored by viewers). Used to tag the collision node so downstream apps

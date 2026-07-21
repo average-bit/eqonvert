@@ -109,6 +109,86 @@ func TestParseCollBufferType1(t *testing.T) {
 	}
 }
 
+// buildType2Body encodes a version-2 type-2 CollBuffer: one strip whose vertices
+// are (quantized delta, baseIdx k) pairs. pos = delta*scale + baseVerts[k].
+func buildType2Body(packing int32, deltas [][3]float32, baseIdx []int16, scale float32) []byte {
+	buf := new(bytes.Buffer)
+	w := func(v int32) { binary.Write(buf, binary.LittleEndian, v) }
+	w(2)                  // type
+	w(0)                  // a
+	w(1)                  // numStrips
+	w(0)                  // c
+	w(packing)            // packing
+	w(int32(len(deltas))) // vertCount
+	w(0)                  // groupId
+	w(0)                  // beginArg
+	for i, d := range deltas {
+		binary.Write(buf, binary.LittleEndian, int16(math.Round(float64(d[0]/scale))))
+		binary.Write(buf, binary.LittleEndian, int16(math.Round(float64(d[1]/scale))))
+		binary.Write(buf, binary.LittleEndian, int16(math.Round(float64(d[2]/scale))))
+		binary.Write(buf, binary.LittleEndian, baseIdx[i])
+	}
+	return buf.Bytes()
+}
+
+// TestParseCollBufferType2BaseAnchor covers the type-2 ZonePreTranslations
+// anchoring recovered from ParseCollBuffer__10VIESFParse: each vertex is
+// delta*scale + baseVerts[k]. Guards the fix that stopped type-2 collision from
+// collapsing onto the origin.
+func TestParseCollBufferType2BaseAnchor(t *testing.T) {
+	scale := float32(1.0 / 16.0) // packing=4, exactly representable multiples
+	deltas := [][3]float32{{1, 2, 3}, {-4, 0.5, 8}, {0, -1, 0}}
+	baseIdx := []int16{2, 0, 1}
+	baseVerts := [][3]float32{{100, 0, 0}, {0, 200, 0}, {0, 0, 300}}
+	body := buildType2Body(4, deltas, baseIdx, scale)
+
+	eq := func(t *testing.T, got, want [3]float32) {
+		t.Helper()
+		for k := 0; k < 3; k++ {
+			if math.Abs(float64(got[k]-want[k])) > 1e-3 {
+				t.Errorf("pos = %v, want %v", got, want)
+				return
+			}
+		}
+	}
+
+	t.Run("base applied by index", func(t *testing.T) {
+		cb, err := ParseCollBuffer(body, binary.LittleEndian, 2, baseVerts)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if len(cb.Positions) != 3 {
+			t.Fatalf("positions = %d, want 3", len(cb.Positions))
+		}
+		for i := range deltas {
+			b := baseVerts[baseIdx[i]]
+			eq(t, cb.Positions[i], [3]float32{deltas[i][0] + b[0], deltas[i][1] + b[1], deltas[i][2] + b[2]})
+		}
+	})
+
+	t.Run("nil base decodes at origin", func(t *testing.T) {
+		cb, err := ParseCollBuffer(body, binary.LittleEndian, 2, nil)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		for i := range deltas {
+			eq(t, cb.Positions[i], deltas[i])
+		}
+	})
+
+	t.Run("out-of-range index falls back to zero", func(t *testing.T) {
+		// Every baseIdx >= len(baseVerts): each must decode with a zero base.
+		oob := buildType2Body(4, deltas, []int16{9, 9, 9}, scale)
+		cb, err := ParseCollBuffer(oob, binary.LittleEndian, 2, baseVerts)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		for i := range deltas {
+			eq(t, cb.Positions[i], deltas[i])
+		}
+	})
+}
+
 func TestParseCollBufferVersion0NoTypeField(t *testing.T) {
 	// version < 2: no type/packing words; type defaults to 0, packing 0.
 	buf := new(bytes.Buffer)

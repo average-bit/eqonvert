@@ -39,92 +39,130 @@ type ESFObject struct {
 	IsZlib     bool
 }
 
-var ObjTypeNames = map[int]string{
-	0x1000: "Surface",
-	0x1001: "SurfaceArray",
-	0x1100: "Material",
-	0x1101: "MaterialArray",
-	0x1110: "MaterialPalette",
-	0x1111: "MaterialPaletteHeader",
-	0x1200: "PrimBuffer",
-	0x1210: "SkinPrimBuffer",
-	0x2000: "SimpleSprite",
-	0x2001: "SimpleSpriteHeader",
-	0x2200: "HSprite",
-	0x2210: "HSpriteHeader",
-	0x2220: "HSpriteArray",
-	0x2310: "SimpleSubSprite",
-	0x2311: "SimpleSubSpriteHeader",
-	0x2320: "SkinSubSprite",
-	0x2321: "SkinSubSprite2",
-	0x2400: "HSpriteHierarchy",
-	0x2450: "HSpriteTriggers",
-	0x2500: "HSpriteAttachments",
-	0x2600: "HSpriteAnim",
-	0x2700: "CSprite",
-	0x2710: "CSpriteHeader",
-	0x2800: "CSpriteArray",
-	0x2a10: "LODSprite",
-	0x2a20: "LodSpriteArray",
-	0x2b00: "PointLight",
-	0x2c00: "GroupSprite",
-	0x2c10: "GroupSpriteHeader",
-	0x2c20: "GroupSpriteArray",
-	0x2c30: "GroupSpriteMembers",
-	0x2d00: "PointSprite",
-	0x2e00: "StreamAudioSprite",
-	0x2e10: "StreamAudioSpriteHeader",
-	0x2f00: "FloraSprite",
-	0x3000: "Zone",
-	0x3100: "ZoneResources",
-	0x3200: "ZoneBase",
-	0x3220: "ZoneTree",
-	0x3230: "ZoneRooms",
-	0x3240: "ZoneRoom",
-	0x3250: "ZonePreTranslations",
-	0x3270: "ZoneRoomActors",
-	0x3280: "ZoneRoomActors2",
-	0x3290: "ZoneActors",
-	0x32a0: "ZoneRoomStaticLightings2",
-	0x32b0: "ZoneStaticLightnings",
-	0x32c0: "ZoneStaticTable",
-	0x32d0: "ZoneFlora",
-	0x4200: "CollBuffer",
-	0x5000: "RefMap",
-	0x6000: "ZoneActor",
-	0x6010: "StaticLighting",
-	0x6020: "StaticLightingObj",
-	0x6030: "ZoneRoomStaticLightings3",
-	0x6040: "ZoneRoomActors3",
-	0x7000: "Font",
-	0x8000: "Root",
-	0x8100: "World",
-	0x8200: "WorldBase",
-	0x8210: "WorldZoneProxies",
-	0x8220: "WorldBaseHeader",
-	0x8230: "WorldTree",
-	0x8240: "WorldRegions",
-	0x9000: "ResourceTable",
-	0xa000: "ResourceDir",
-	0xa010: "ResourceDir2",
-	0xb000: "Adpcm",
-	0xb010: "AdpcmHeader",
-	0xb020: "AdpcmSampleData",
-	0xb030: "Xm",
-	0xb040: "XmHeader",
-	0xb060: "XmSampleData",
-	0xb100: "SoundSprite",
-	0xc000: "ParticleDefinition",
-	0xc100: "ParticleSprite",
-	0xc101: "ParticleSpriteHeader",
-	0xc200: "SpellEffect",
-	0xc300: "EffectVolumeSprite",
-	0xc310: "EffectVolumeSpriteHeader",
+// objTypeInfoEntry is the single source of truth for per-object-type metadata.
+// Previously this knowledge was duplicated across ObjTypeNames (name lookup),
+// the DictID-extraction switch in ReadObject, and the ReadRaw rationale comment.
+type objTypeInfoEntry struct {
+	// name is the human-readable object-type name.
+	name string
+	// extractsDictID is true for types whose first 4 body bytes hold a dictionary
+	// ID that ReadObject registers in the ESF dictionary map.
+	extractsDictID bool
+	// subObjsAreFormatFlag is true for types where ObjectHeader.NumberOfSubObjects
+	// is a format-version indicator rather than a real nested-object count
+	// (e.g. 0x2600 HSpriteAnim/ActionSet, 0xC000 ParticleDefinition). Documentation
+	// only for now: parsing of these types is handled by ReadRaw at the call site
+	// and this flag is NOT (yet) consulted to change parsing behavior.
+	subObjsAreFormatFlag bool
 }
 
+// objTypeInfo is the centralized ESF object-type table. It reproduces exactly the
+// former ObjTypeNames map (names), the former DictID-extraction switch set
+// (extractsDictID), and the ReadRaw format-flag types (subObjsAreFormatFlag).
+var objTypeInfo = map[uint16]objTypeInfoEntry{
+	0x1000: {name: "Surface", extractsDictID: true},
+	0x1001: {name: "SurfaceArray"},
+	0x1100: {name: "Material", extractsDictID: true},
+	0x1101: {name: "MaterialArray"},
+	0x1110: {name: "MaterialPalette"},
+	0x1111: {name: "MaterialPaletteHeader"},
+	0x1200: {name: "PrimBuffer", extractsDictID: true},
+	0x1210: {name: "SkinPrimBuffer", extractsDictID: true},
+	0x2000: {name: "SimpleSprite", extractsDictID: true},
+	0x2001: {name: "SimpleSpriteHeader"},
+	0x2200: {name: "HSprite", extractsDictID: true},
+	0x2210: {name: "HSpriteHeader"},
+	0x2220: {name: "HSpriteArray"},
+	0x2310: {name: "SimpleSubSprite", extractsDictID: true},
+	0x2311: {name: "SimpleSubSpriteHeader"},
+	0x2320: {name: "SkinSubSprite", extractsDictID: true},
+	0x2321: {name: "SkinSubSprite2"},
+	0x2400: {name: "HSpriteHierarchy"},
+	0x2450: {name: "HSpriteTriggers"},
+	0x2500: {name: "HSpriteAttachments"},
+	0x2600: {name: "HSpriteAnim", subObjsAreFormatFlag: true},
+	0x2700: {name: "CSprite", extractsDictID: true},
+	0x2710: {name: "CSpriteHeader"},
+	0x2800: {name: "CSpriteArray"},
+	0x2a10: {name: "LODSprite", extractsDictID: true},
+	0x2a20: {name: "LodSpriteArray"},
+	0x2b00: {name: "PointLight"},
+	0x2c00: {name: "GroupSprite", extractsDictID: true},
+	0x2c10: {name: "GroupSpriteHeader"},
+	0x2c20: {name: "GroupSpriteArray"},
+	0x2c30: {name: "GroupSpriteMembers", extractsDictID: true},
+	0x2d00: {name: "PointSprite"},
+	0x2e00: {name: "StreamAudioSprite"},
+	0x2e10: {name: "StreamAudioSpriteHeader"},
+	0x2f00: {name: "FloraSprite"},
+	0x3000: {name: "Zone"},
+	0x3100: {name: "ZoneResources"},
+	0x3200: {name: "ZoneBase"},
+	0x3220: {name: "ZoneTree"},
+	0x3230: {name: "ZoneRooms"},
+	0x3240: {name: "ZoneRoom", extractsDictID: true},
+	0x3250: {name: "ZonePreTranslations"},
+	0x3270: {name: "ZoneRoomActors"},
+	0x3280: {name: "ZoneRoomActors2"},
+	0x3290: {name: "ZoneActors"},
+	0x32a0: {name: "ZoneRoomStaticLightings2"},
+	0x32b0: {name: "ZoneStaticLightnings"},
+	0x32c0: {name: "ZoneStaticTable"},
+	0x32d0: {name: "ZoneFlora"},
+	0x4200: {name: "CollBuffer"},
+	0x5000: {name: "RefMap"},
+	0x6000: {name: "ZoneActor", extractsDictID: true},
+	0x6010: {name: "StaticLighting"},
+	0x6020: {name: "StaticLightingObj", extractsDictID: true},
+	0x6030: {name: "ZoneRoomStaticLightings3"},
+	0x6040: {name: "ZoneRoomActors3"},
+	0x7000: {name: "Font"},
+	0x8000: {name: "Root"},
+	0x8100: {name: "World"},
+	0x8200: {name: "WorldBase"},
+	0x8210: {name: "WorldZoneProxies"},
+	0x8220: {name: "WorldBaseHeader"},
+	0x8230: {name: "WorldTree"},
+	0x8240: {name: "WorldRegions"},
+	0x9000: {name: "ResourceTable"},
+	0xa000: {name: "ResourceDir", extractsDictID: true},
+	0xa010: {name: "ResourceDir2"},
+	0xb000: {name: "Adpcm", extractsDictID: true},
+	0xb010: {name: "AdpcmHeader"},
+	0xb020: {name: "AdpcmSampleData"},
+	0xb030: {name: "Xm", extractsDictID: true},
+	0xb040: {name: "XmHeader"},
+	0xb060: {name: "XmSampleData"},
+	0xb100: {name: "SoundSprite", extractsDictID: true},
+	0xc000: {name: "ParticleDefinition", subObjsAreFormatFlag: true},
+	0xc100: {name: "ParticleSprite"},
+	0xc101: {name: "ParticleSpriteHeader"},
+	0xc200: {name: "SpellEffect"},
+	0xc300: {name: "EffectVolumeSprite"},
+	0xc310: {name: "EffectVolumeSpriteHeader"},
+}
+
+// ObjTypeNames is a thin derived view of objTypeInfo (object type -> name),
+// retained for backward compatibility with external references (see docs/FORMATS.md).
+// Keys are int to match the historical map type.
+var ObjTypeNames = func() map[int]string {
+	m := make(map[int]string, len(objTypeInfo))
+	for t, info := range objTypeInfo {
+		m[int(t)] = info.name
+	}
+	return m
+}()
+
 func GetObjectTypeName(objType int) string {
-	if name, ok := ObjTypeNames[objType]; ok {
-		return name
+	// Preserve the historical int-keyed lookup exactly: the old ObjTypeNames map
+	// had only non-negative keys (0x1000..0xC310), so any objType outside the
+	// uint16 range (including negative int16 values sign-extended by callers)
+	// missed and fell through to the hex fallback. Guard on range before masking
+	// so that behavior is byte-identical.
+	if objType >= 0 && objType <= 0xFFFF {
+		if info, ok := objTypeInfo[uint16(objType)]; ok {
+			return info.name
+		}
 	}
 	return fmt.Sprintf("Unknown(0x%04X)", objType)
 }
@@ -219,8 +257,11 @@ func ReadObject(r io.ReadSeeker, order binary.ByteOrder, offset int64, dict map[
 		var id uint32
 		binary.Read(r, order, &id)
 
-		switch uint16(h.ObjectType) {
-		case 0x1000, 0x1100, 0x1200, 0x1210, 0x2000, 0x2200, 0x2700, 0x2C00, 0x2A10, 0x2310, 0x2320, 0x2C30, 0xA000, 0xB000, 0xB030, 0xB100, 0x6000, 0x6020, 0x3240:
+		// For the subset of object types whose first 4 body bytes hold a
+		// dictionary ID (objTypeInfo[...].extractsDictID), register the object
+		// in the ESF dictionary map. Types not marked extractsDictID reuse those
+		// first 4 bytes for other purposes and must not be indexed.
+		if info, ok := objTypeInfo[uint16(h.ObjectType)]; ok && info.extractsDictID {
 			if id != 0 {
 				obj.DictID = id
 				dict[id] = obj

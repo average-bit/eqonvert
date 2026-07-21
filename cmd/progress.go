@@ -3,6 +3,8 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
+	"time"
 
 	"github.com/schollz/progressbar/v3"
 	"golang.org/x/term"
@@ -17,8 +19,31 @@ var stderrTTY = term.IsTerminal(int(os.Stderr.Fd()))
 // progressVisible reports whether animated progress should be shown.
 func progressVisible() bool { return stderrTTY && !quiet }
 
+// startHeartbeat re-renders bar once per second so its elapsed/ETA timer keeps
+// advancing (and spinners keep spinning) during a long single step that fires no
+// Add() — e.g. converting one huge TUNARIA.ESF, where the top-level bar sits on a
+// single item for minutes and would otherwise look frozen. RenderBlank is
+// mutex-guarded inside progressbar, so it is safe to call concurrently with the
+// main loop's Add()/Describe(). The returned func stops the heartbeat and must be
+// called when the bar finishes (wired through OptionOnCompletion).
+func startHeartbeat(bar *progressbar.ProgressBar) func() {
+	var done atomic.Bool
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for range t.C {
+			if done.Load() {
+				return
+			}
+			_ = bar.RenderBlank()
+		}
+	}()
+	return func() { done.Store(true) }
+}
+
 // newBar returns a determinate progress bar writing to stderr.
 func newBar(total int, desc string) *progressbar.ProgressBar {
+	stopHB := func() {}
 	opts := []progressbar.Option{
 		progressbar.OptionSetWriter(os.Stderr),
 		progressbar.OptionSetDescription(desc),
@@ -33,13 +58,21 @@ func newBar(total int, desc string) *progressbar.ProgressBar {
 		}),
 	}
 	if progressVisible() {
-		opts = append(opts, progressbar.OptionOnCompletion(func() { fmt.Fprint(os.Stderr, "\n") }))
+		opts = append(opts, progressbar.OptionOnCompletion(func() {
+			stopHB()
+			fmt.Fprint(os.Stderr, "\n")
+		}))
 	}
-	return progressbar.NewOptions(total, opts...)
+	bar := progressbar.NewOptions(total, opts...)
+	if progressVisible() {
+		stopHB = startHeartbeat(bar)
+	}
+	return bar
 }
 
 // newSpinner returns an indeterminate spinner writing to stderr.
 func newSpinner(desc string) *progressbar.ProgressBar {
+	stopHB := func() {}
 	opts := []progressbar.Option{
 		progressbar.OptionSetWriter(os.Stderr),
 		progressbar.OptionSpinnerType(14),
@@ -48,7 +81,14 @@ func newSpinner(desc string) *progressbar.ProgressBar {
 		progressbar.OptionClearOnFinish(),
 	}
 	if progressVisible() {
-		opts = append(opts, progressbar.OptionOnCompletion(func() { fmt.Fprint(os.Stderr, "\n") }))
+		opts = append(opts, progressbar.OptionOnCompletion(func() {
+			stopHB()
+			fmt.Fprint(os.Stderr, "\n")
+		}))
 	}
-	return progressbar.NewOptions(-1, opts...)
+	bar := progressbar.NewOptions(-1, opts...)
+	if progressVisible() {
+		stopHB = startHeartbeat(bar)
+	}
+	return bar
 }

@@ -4,8 +4,26 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"image"
+	"image/png"
 	"io"
 )
+
+// AddImageTexture PNG-encodes img, appends it as a glTF image + texture, and
+// returns the texture index. Used to embed effect textures (e.g. particle
+// sprites) that are referenced from node extras rather than a material.
+func (b *Builder) AddImageTexture(img image.Image) int {
+	buf := new(bytes.Buffer)
+	if err := png.Encode(buf, img); err != nil {
+		return -1
+	}
+	bvIdx := b.AddBufferView(buf.Bytes(), 0)
+	imgIdx := len(b.Doc.Images)
+	b.Doc.Images = append(b.Doc.Images, Image{BufferView: bvIdx, MimeType: "image/png"})
+	texIdx := len(b.Doc.Textures)
+	b.Doc.Textures = append(b.Doc.Textures, Texture{Source: imgIdx})
+	return texIdx
+}
 
 type Builder struct {
 	Doc     *GLTF
@@ -146,11 +164,26 @@ func (b *Builder) AddCollisionNode(name string, positions [][3]float32, indices 
 	idxBv := b.AddBufferView(idxBuf.Bytes(), 34963) // ELEMENT_ARRAY_BUFFER
 	idxAcc := b.AddAccessor(idxBv, 0, 5125, len(indices), "SCALAR", false)
 
+	// Translucent, double-sided material so the collision hull is visible as a
+	// faint shell without obscuring the visual geometry it wraps.
+	matIdx := len(b.Doc.Materials)
+	b.Doc.Materials = append(b.Doc.Materials, Material{
+		Name:        "collision",
+		AlphaMode:   "BLEND",
+		DoubleSided: true,
+		PBRMetallicRoughness: &PBR{
+			BaseColorFactor: []float32{0.15, 0.7, 1.0, 0.18}, // faint cyan
+			MetallicFactor:  0,
+			RoughnessFactor: 1,
+		},
+	})
+
 	mesh := Mesh{
 		Name: name,
 		Primitives: []Primitive{{
 			Attributes: map[string]int{"POSITION": posAcc},
 			Indices:    &idxAcc,
+			Material:   &matIdx,
 		}},
 	}
 	meshIdx := b.AddMesh(mesh)

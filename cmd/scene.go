@@ -73,7 +73,7 @@ var sceneCmd = &cobra.Command{
 }
 
 func init() {
-	rootCmd.AddCommand(sceneCmd)
+	devCmd.AddCommand(sceneCmd)
 }
 
 func collectActors(r io.ReadSeeker, objects []*eqoa.ESFObject, order binary.ByteOrder, actors *[]eqoa.ZoneActor) {

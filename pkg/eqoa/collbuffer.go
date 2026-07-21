@@ -66,12 +66,14 @@ type CollStrip struct {
 // version is the ESF object header's ObjectVersion (needed because type/packing
 // are only present in the stream for version >= 2).
 //
-// baseVerts is the type-2 base-vertex table: the zone's render-mesh vertex pool,
-// indexed by the per-vertex baseIdx (stride vec3, world space). The client sources
-// it from the ESFParse zone context (*(esfParse+7)+0x78). Pass nil when it is
-// unavailable; type-2 vertices then decode with a zero base vector, which is exact
-// for records whose baseIdx is 0 (the common case in observed zone data) and a
-// documented best-effort otherwise. Out-of-range indices also fall back to zero.
+// baseVerts is the type-2 base-vertex table: the zone's ZonePreTranslations
+// (0x3250) array, indexed by the per-vertex baseIdx k (stride vec3, world space).
+// This was verified against the client: ParseCollBuffer__10VIESFParse reads the
+// base from *(VIZone+0x78)+k*0xc, and ParseZonePreTranslations__10VIESFParse is
+// the sole writer of that VIZone+0x74/+0x78 array. Pass the full unfiltered
+// 0x3250 list. Pass nil when unavailable; type-2 vertices then decode with a zero
+// base (correct only where every baseIdx is 0). Out-of-range indices fall back to
+// zero.
 func ParseCollBuffer(body []byte, order binary.ByteOrder, version int, baseVerts [][3]float32) (*CollBuffer, error) {
 	p := 0
 	need := func(n int) bool { return p+n <= len(body) }
@@ -142,9 +144,12 @@ func ParseCollBuffer(body []byte, order binary.ByteOrder, version int, baseVerts
 				qz := float32(ri16()) * cb.Scale
 				k := int(ri16())
 				var base [3]float32
-				// k is a base-vertex index (standard sub-variant). The rare grouped
-				// sub-variant reuses this field as a VertexGroup id and adds no base;
-				// with baseVerts==nil both decode identically (base = zero vector).
+				// k indexes the ZonePreTranslations base pool (standard sub-variant,
+				// client *(collbuffer+8)==0). A rare grouped sub-variant reuses this
+				// field as a VertexGroup id and adds no base; it is not present in the
+				// observed zone data (adding the base yields a coherent world-space
+				// hull rather than the scatter a mis-added group id would produce), so
+				// only the standard decode is implemented here.
 				if baseVerts != nil && k >= 0 && k < len(baseVerts) {
 					base = baseVerts[k]
 				}

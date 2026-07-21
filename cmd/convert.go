@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/draw"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/average-bit/eqonvert/pkg/eqoa"
 	"github.com/average-bit/eqonvert/pkg/gltf"
@@ -26,10 +28,113 @@ var (
 	spawnScale float64
 )
 
-// collisionExport, when set, emits each zone's decoded 0x4200 CollBuffer geometry
-// as a separate "collision" glTF node (tagged extras {"collision":true}). Default
-// OFF so the normal visual export is byte-for-byte unchanged. See convert_zone.go.
+// collisionExport emits each zone's decoded 0x4200 CollBuffer geometry as a
+// separate "collision" glTF node (tagged extras {"collision":true}). ON by
+// default — collision is core game data (the engine's floor/wall pathing reads
+// it), so preservation exports should keep it; downstream apps filter it via the
+// tag. Disable with --collision=false. See convert_zone.go.
 var collisionExport bool
+
+// forceExport overrides the source-aware output-dir guard (see guardOutputDir).
+var forceExport bool
+
+// manifestName is the marker file eqonvert writes into an output directory to
+// record which input it was populated from.
+const manifestName = ".eqonvert-manifest.json"
+
+// exportManifest records which input populated an output directory, so a later
+// run can refuse to mix a different source into the same folder.
+type exportManifest struct {
+	Source     string `json:"source"`      // absolute, cleaned input path
+	SourceName string `json:"source_name"` // basename, for messages
+	CreatedAt  string `json:"created_at"`  // RFC3339
+	Tool       string `json:"tool"`
+}
+
+// sourceIdentity returns the absolute (cleaned) path used to compare export
+// sources, plus its basename for user-facing messages.
+func sourceIdentity(p string) (abs, base string) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		abs = filepath.Clean(p)
+	}
+	return abs, filepath.Base(abs)
+}
+
+// readManifest loads an output dir's export manifest, if present and valid.
+func readManifest(dir string) (*exportManifest, bool) {
+	b, err := os.ReadFile(filepath.Join(dir, manifestName))
+	if err != nil {
+		return nil, false
+	}
+	var m exportManifest
+	if json.Unmarshal(b, &m) != nil {
+		return nil, false
+	}
+	return &m, true
+}
+
+// countFiles counts regular files under dir (excluding the manifest itself),
+// for the "N files" figure in guard messages.
+func countFiles(dir string) int {
+	n := 0
+	filepath.Walk(dir, func(_ string, f os.FileInfo, err error) error {
+		if err == nil && !f.IsDir() && f.Name() != manifestName {
+			n++
+		}
+		return nil
+	})
+	return n
+}
+
+// guardOutputDir enforces the source-aware export protection BEFORE any work:
+// it refuses to write into a directory that already holds an export from a
+// different input (or a non-empty dir with no manifest, when -o is explicit),
+// unless --force is set. It does not write anything — call stampOutputDir on
+// success so an aborted run never falsely marks a folder.
+func guardOutputDir(inputPath string) error {
+	outDir, explicit := outputDir, outputDir != ""
+	if outDir == "" {
+		outDir = "."
+	}
+	srcAbs, srcBase := sourceIdentity(inputPath)
+
+	if m, ok := readManifest(outDir); ok {
+		if m.Source != srcAbs && !forceExport {
+			return fmt.Errorf("output dir %q already holds an export of %q (%s, %d files); "+
+				"refusing to mix %q in — choose a new -o dir, or pass --force",
+				outDir, m.SourceName, m.CreatedAt, countFiles(outDir), srcBase)
+		}
+		return nil // same source, or forced: leave the existing manifest intact
+	}
+	if explicit && !forceExport {
+		if n := countFiles(outDir); n > 0 {
+			return fmt.Errorf("output dir %q is not empty (%d files) and has no eqonvert "+
+				"manifest; use an empty dir, or pass --force to write here", outDir, n)
+		}
+	}
+	return nil
+}
+
+// stampOutputDir writes the export manifest after a successful run. It never
+// overwrites an existing manifest (preserving the folder's original identity,
+// including when a different source was merged in via --force).
+func stampOutputDir(inputPath string) {
+	outDir := outputDir
+	if outDir == "" {
+		outDir = "."
+	}
+	if _, ok := readManifest(outDir); ok {
+		return
+	}
+	srcAbs, srcBase := sourceIdentity(inputPath)
+	m := exportManifest{srcAbs, srcBase, time.Now().Format(time.RFC3339), "eqonvert"}
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(outDir, manifestName), b, 0644)
+}
 
 // progressStep, when non-nil, is called once per unit of intra-file work — each
 // sprite exported and each zone assembled. Single-file conversion of a large ESF
@@ -52,13 +157,26 @@ Audio (FLAC) and video (FMV) output use ffmpeg + openmpt123 when present; they
 are optional — models convert fine without them. Install both with:
 brew install ffmpeg libopenmpt`,
 	Args: cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
+	RunE: func(cmd *cobra.Command, args []string) (err error) {
 		warnMissingTools()
 		path := args[0]
 		info, err := os.Stat(path)
 		if err != nil {
 			return err
 		}
+
+		// Source-aware guard: refuse to mix a different input into a folder that
+		// already holds an export (see guardOutputDir). Runs before any work.
+		if err = guardOutputDir(path); err != nil {
+			return err
+		}
+		// Stamp the manifest only on an error-free return, so an aborted or hung
+		// run never falsely marks the folder's source.
+		defer func() {
+			if err == nil {
+				stampOutputDir(path)
+			}
+		}()
 
 		if info.IsDir() {
 			// Pass 1: collect asset files and build cross-file surface registry.
@@ -226,7 +344,7 @@ func convertAssetData(data []byte, name, mediaOut, esfOut string,
 		}
 	default: // .esf / .csf
 		n := convertESFData(data, name, registry, verbose, esfOut)
-		convertZoneESFData(data, name, esfOut, verbose, lib, lightLib, resDir)
+		convertZoneESFData(data, name, esfOut, verbose, lib, lightLib, resDir, registry)
 		return n
 	}
 	return 0
@@ -267,6 +385,7 @@ func convertISO(path string) error {
 	lightLib := LightLibrary{}
 	resDir := ResourceDirectory{}
 	for _, isoFile := range files {
+		isoFile := isoFile // capture for the lazy re-read closure
 		shortName := isoFile.Path[strings.LastIndexByte(isoFile.Path, '/')+1:]
 		regBar.Describe(fmt.Sprintf("Registry  %-20s", shortName))
 		if is16Ext(shortName) || isBGMExt(shortName) {
@@ -289,7 +408,7 @@ func convertISO(path string) error {
 				lightLib[id] = ld
 			}
 		}
-		for id, entry := range resourceDirFromData(data) {
+		for id, entry := range resourceDirFromData(data, func() ([]byte, error) { return isoFile.ReadAll(f) }) {
 			if _, exists := resDir[id]; !exists {
 				resDir[id] = entry
 			}
@@ -689,6 +808,8 @@ func generateGLB(r io.ReadSeeker, asset *eqoa.Asset, order binary.ByteOrder, pre
 
 func init() {
 	convertCmd.Flags().StringVarP(&outputDir, "output", "o", "", "Output directory for GLB files (default: current directory)")
+	convertCmd.Flags().BoolVar(&forceExport, "force", false, "write into a non-empty or different-source output dir (overrides the export guard)")
+	convertCmd.Flags().BoolVar(&collisionExport, "collision", true, "export zone collision geometry (0x4200 CollBuffer) as a tagged 'collision' node (on by default; --collision=false to omit)")
 	convertCmd.Flags().BoolVar(&markSpawns, "mark-spawns", false, "place a built-in marker at unresolved spawn actors in assembled zones")
 	convertCmd.Flags().Float64Var(&spawnScale, "spawn-scale", 1.0, "size multiplier for spawn markers (world units; markers are small vs a zone)")
 	rootCmd.AddCommand(convertCmd)
