@@ -210,8 +210,16 @@ func (za *ZoneAssembler) embedSurfaces(r io.ReadSeeker, surfaceArrays []*eqoa.ES
 		}
 	}
 	// Fallback: for any needed DictID still missing, try the global pool.
+	// Iterate in sorted DictID order so fallback images/textures embed
+	// deterministically — map iteration order otherwise varies run-to-run,
+	// producing byte-different (though structurally identical) GLBs.
 	if za.fallbackSurfaces != nil && neededIDs != nil {
+		missing := make([]uint32, 0, len(neededIDs))
 		for id := range neededIDs {
+			missing = append(missing, id)
+		}
+		sort.Slice(missing, func(i, j int) bool { return missing[i] < missing[j] })
+		for _, id := range missing {
 			if _, ok := za.surfaceToIndex[id]; ok {
 				continue
 			}
