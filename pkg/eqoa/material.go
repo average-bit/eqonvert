@@ -2,6 +2,7 @@ package eqoa
 
 import (
 	"encoding/binary"
+	"math"
 )
 
 type MaterialLayer struct {
@@ -10,6 +11,12 @@ type MaterialLayer struct {
 	WrapMode  int32
 	BlendMode int32
 	Color     [4]float32
+	// Scroll is the layer's per-frame UV scroll rate (u, v), read from the last
+	// 8 bytes of the 68-byte layer. A non-zero scroll is the engine's marker for
+	// an ANIMATED surface — scrolling water, lava and cloud layers use it — so it
+	// is the reliable signal for "this is water" in the zone exporter (texture
+	// DictIDs are per-zone; the scroll rate is intrinsic to the material).
+	Scroll [2]float32
 }
 
 type Material struct {
@@ -105,6 +112,13 @@ func ParseMaterialBody(data []byte, version int16, order binary.ByteOrder) (*Mat
 		cb := data[offset+18]
 		ca := data[offset+19]
 		layer.Color = [4]float32{float32(cr) / 255.0, float32(cg) / 255.0, float32(cb) / 255.0, float32(ca) / 255.0}
+
+		// UV scroll rate — the last 8 bytes of the 68-byte layer (after the 3x3
+		// UV matrix and the LOD bias). Non-zero = an animated surface.
+		layer.Scroll = [2]float32{
+			math.Float32frombits(order.Uint32(data[offset+60 : offset+64])),
+			math.Float32frombits(order.Uint32(data[offset+64 : offset+68])),
+		}
 
 		offset += layerStride
 		m.Layers = append(m.Layers, layer)

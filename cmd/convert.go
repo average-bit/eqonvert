@@ -531,7 +531,7 @@ func convertESFData(data []byte, sourceName string, registry *eqoa.SurfaceRegist
 	sprites := 0
 	processed := make(map[int64]bool)
 	for _, obj := range objects {
-		processObject(esfReader, obj, order, prefix, processed, registry, nil, verbose, &sprites, outDir)
+		processObject(esfReader, obj, order, prefix, processed, registry, nil, nil, verbose, &sprites, outDir)
 	}
 	return sprites
 
@@ -740,11 +740,29 @@ func writeMusicXM(r io.ReadSeeker, objects []*eqoa.ESFObject, order binary.ByteO
 // ambientPal is the nearest enclosing 0x1110 MaterialPalette above this
 // object — inherited by sprites that have no palette of their own (e.g.
 // 0x2310 zone terrain sprites and 0x2320 sub-sprites inside a 0x2700).
-func processObject(r io.ReadSeeker, obj *eqoa.ESFObject, order binary.ByteOrder, prefix string, processed map[int64]bool, registry *eqoa.SurfaceRegistry, ambientPal *eqoa.ESFObject, verbose bool, sprites *int, outDir string) {
+//
+// owner is the nearest enclosing CSprite (0x2700) or HSprite (0x2200), or nil.
+// A sub-sprite mesh under one is part of that model and is drawn inside its
+// GLB, so it is not exported again as a lone, skeleton-less GLB — unless the
+// owner failed to load or drew nothing, in which case it is exported on its own
+// so its geometry is not lost.
+func processObject(r io.ReadSeeker, obj *eqoa.ESFObject, order binary.ByteOrder, prefix string, processed map[int64]bool, registry *eqoa.SurfaceRegistry, ambientPal *eqoa.ESFObject, owner *spriteOwner, verbose bool, sprites *int, outDir string) {
 	if processed[obj.Offset] {
 		return
 	}
-	if eqoa.IsSprite(uint16(obj.Header.ObjectType)) {
+	objType := uint16(obj.Header.ObjectType)
+	if skipSubSprite(objType, owner) {
+		processed[obj.Offset] = true
+		if verbose {
+			logf("  sprite 0x%X is part of model 0x%X, not exported alone\n", obj.DictID, owner.id)
+		}
+		return
+	}
+	var self *spriteOwner
+	if owner == nil && eqoa.IsSkinnedSprite(objType) {
+		self = &spriteOwner{id: obj.DictID}
+	}
+	if eqoa.IsSprite(objType) {
 		processed[obj.Offset] = true
 		func() {
 			defer func() {
@@ -773,7 +791,9 @@ func processObject(r io.ReadSeeker, obj *eqoa.ESFObject, order binary.ByteOrder,
 						logf("    Warning: attach slots dropped: %v\n", asset.AttachSlotsErr)
 					}
 				}
-				generateGLB(r, asset, order, prefix, registry, verbose, outDir)
+				if generateGLB(r, asset, order, prefix, registry, verbose, outDir) && self != nil {
+					self.drawn = true
+				}
 				*sprites++
 				if progressStep != nil {
 					progressStep()
@@ -792,12 +812,30 @@ func processObject(r io.ReadSeeker, obj *eqoa.ESFObject, order binary.ByteOrder,
 		}
 	}
 
+	if self != nil {
+		owner = self
+	}
 	for _, child := range obj.Children {
-		processObject(r, child, order, prefix, processed, registry, newAmbient, verbose, sprites, outDir)
+		processObject(r, child, order, prefix, processed, registry, newAmbient, owner, verbose, sprites, outDir)
 	}
 }
 
-func generateGLB(r io.ReadSeeker, asset *eqoa.Asset, order binary.ByteOrder, prefix string, registry *eqoa.SurfaceRegistry, verbose bool, outDir string) {
+// spriteOwner is a CSprite or HSprite whose subtree is being walked: its DictID
+// and whether its GLB was written.
+type spriteOwner struct {
+	id    uint32
+	drawn bool
+}
+
+// skipSubSprite reports whether a sprite of objType is a sub-sprite mesh drawn
+// inside owner's GLB. On Frontiers CHAR.ESF exporting these alone added 608
+// T-pose GLBs with no skeleton or animation (1190 GLBs, 582 without them).
+func skipSubSprite(objType uint16, owner *spriteOwner) bool {
+	return owner != nil && owner.drawn && eqoa.IsSubSprite(objType)
+}
+
+// generateGLB writes the asset's GLB and reports whether it was written.
+func generateGLB(r io.ReadSeeker, asset *eqoa.Asset, order binary.ByteOrder, prefix string, registry *eqoa.SurfaceRegistry, verbose bool, outDir string) bool {
 	b := gltf.NewBuilder()
 	// Character/item sprites may have sheer cloth (translucency gradients) that
 	// must BLEND; zone/environment sprites keep foliage cutouts on MASK to avoid
@@ -814,7 +852,7 @@ func generateGLB(r io.ReadSeeker, asset *eqoa.Asset, order binary.ByteOrder, pre
 		if verbose {
 			logf("    Error exporting: %v\n", err)
 		}
-		return
+		return false
 	}
 	b.AddSceneNode(rootIdx)
 
@@ -822,7 +860,7 @@ func generateGLB(r io.ReadSeeker, asset *eqoa.Asset, order binary.ByteOrder, pre
 		if verbose {
 			logf("    Error creating output dir: %v\n", err)
 		}
-		return
+		return false
 	}
 
 	// Tag GLBs that carry skeletal animation so animated vs. static meshes are
@@ -841,7 +879,7 @@ func generateGLB(r io.ReadSeeker, asset *eqoa.Asset, order binary.ByteOrder, pre
 		if verbose {
 			logf("    Error creating file: %v\n", err)
 		}
-		return
+		return false
 	}
 	b.WriteGLB(outF)
 	outF.Close()
@@ -859,6 +897,7 @@ func generateGLB(r io.ReadSeeker, asset *eqoa.Asset, order binary.ByteOrder, pre
 	if err := writeAttachmentSidecar(asset, b, outPath); err != nil && verbose {
 		logf("    Warning: attachment sidecar: %v\n", err)
 	}
+	return true
 }
 
 func init() {

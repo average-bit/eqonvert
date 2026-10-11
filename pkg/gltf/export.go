@@ -211,6 +211,12 @@ func ExportAssetToBuilder(b *Builder, r io.ReadSeeker, asset *eqoa.Asset, order 
 // overridden. See AppearanceSpec for the (heuristic) slot model.
 func ExportAssetToBuilderWithAppearance(b *Builder, r io.ReadSeeker, asset *eqoa.Asset, order binary.ByteOrder, registry *eqoa.SurfaceRegistry, blendGradients bool, appearance *AppearanceSpec) (int, error) {
 	rootNodeIdx := b.AddNode(Node{Name: fmt.Sprintf("Sprite_0x%X", asset.ID)})
+	// The CSprite's 0x2710 size factor scales the whole sprite. The root node is
+	// the parent of the skeleton's root joints and of the rigid meshes, so
+	// joints, root motion and skinned vertices all scale with it.
+	if sf := asset.SizeFactor; sf > 0 && sf != 1 {
+		b.Doc.Nodes[rootNodeIdx].Scale = []float32{sf, sf, sf}
+	}
 
 	// Add Skeleton
 	var jointNodeIndices []int
@@ -851,40 +857,136 @@ func ExportAssetToBuilderWithAppearance(b *Builder, r io.ReadSeeker, asset *eqoa
 	return rootNodeIdx, nil
 }
 
-// animStateNames maps the logical animation pair index (== the AnimationState
-// byte ID the EQOA server sends) to a human-readable name.  Populated at
-// startup by the cmd package from the version-controlled
+// animStateNames maps an animation id (the 0x2910 AnimID, which is the
+// AnimationState byte ID the EQOA server sends) to a human-readable name.
+// Populated at startup by the cmd package from the version-controlled
 // cmd/animation_names.json — edit the JSON, not this file.
 var animStateNames = map[int]string{}
 
-// SetAnimationNames installs the pair-index → name table used when naming
+// SetAnimationNames installs the animation id → name table used when naming
 // exported glTF animations.
 func SetAnimationNames(names map[int]string) {
 	animStateNames = names
 }
 
-// animationName builds the glTF animation name: the AnimationState ID and
-// name when known, the body half (the half whose channels include the root
-// joint drives the legs/lower body), and the DictID for traceability.
-func animationName(ai int, dictID uint32, includesRoot bool) string {
-	pairIdx := ai / 2
-	part := "upper"
-	if includesRoot {
-		part = "lower"
-	}
-	if name, ok := animStateNames[pairIdx]; ok {
-		return fmt.Sprintf("0x%02X_%s_%s_0x%X", pairIdx, name, part, dictID)
-	}
-	return fmt.Sprintf("0x%02X_Unknown_%s_0x%X", pairIdx, part, dictID)
+// clipItem is one exported ActionSet: its index in asset.Actions, its DictID
+// and whether its channels include the root joint (the lower half).
+type clipItem struct {
+	ai           int
+	dictID       uint32
+	includesRoot bool
 }
 
-// mergedAnimationName builds the name for the combined full-body clip (upper +
-// lower merged) — the action name without a body-half suffix.
-func mergedAnimationName(pairIdx int, dictID uint32) string {
-	if name, ok := animStateNames[pairIdx]; ok {
-		return fmt.Sprintf("0x%02X_%s_0x%X", pairIdx, name, dictID)
+func (it clipItem) half() string {
+	if it.includesRoot {
+		return "lower"
 	}
-	return fmt.Sprintf("0x%02X_Unknown_0x%X", pairIdx, dictID)
+	return "upper"
+}
+
+// clipGroup is one merged full-body clip.
+type clipGroup struct {
+	animID  int  // the 0x2910 AnimID; meaningless when !mapped
+	mapped  bool // false: no 0x2910 record names these ActionSets
+	members []clipItem
+	owned   []clipItem // members whose layer clip belongs to this group
+	name    string
+}
+
+// clipPlan is how a sprite's ActionSets group into clips, and every name.
+type clipPlan struct {
+	groups    []clipGroup
+	groupOf   map[int]int    // ai -> index in groups
+	layerName map[int]string // ai -> layer clip name
+}
+
+// planClips groups the exported ActionSets into merged clips and names every
+// clip from the sprite's 0x2910 animation table.
+//
+// With a table, each 0x2910 record is one merged clip: the ActionSets whose
+// DictID is its ActionID or Action2ID (the two halves the record plays
+// together), named by its AnimID. Records are taken in table order; an
+// ActionSet named by more than one record (ids that reuse a partner's clips)
+// is owned by the first, and a record whose sets are all owned already adds
+// no clip, since it would repeat the owner's data. ActionSets no record names,
+// and every ActionSet of a sprite without a table, are unmapped: they are
+// labeled "Unmapped" with their raw index and never get a name. Without a
+// table the old consecutive pairing (ai/2) still groups them, so props keep
+// their merged clips; with a table an unnamed set stands alone.
+func planClips(items []clipItem, table []eqoa.CSpriteAnimation) clipPlan {
+	p := clipPlan{groupOf: map[int]int{}, layerName: map[int]string{}}
+	if len(table) > 0 {
+		byDict := map[uint32][]clipItem{}
+		for _, it := range items {
+			byDict[it.dictID] = append(byDict[it.dictID], it)
+		}
+		for _, rec := range table {
+			var members []clipItem
+			inMembers := map[int]bool{}
+			for _, id := range []uint32{rec.ActionID, rec.Action2ID} {
+				if id == 0 {
+					continue
+				}
+				for _, it := range byDict[id] {
+					if !inMembers[it.ai] {
+						inMembers[it.ai] = true
+						members = append(members, it)
+					}
+				}
+			}
+			var owned []clipItem
+			for _, it := range members {
+				if _, taken := p.groupOf[it.ai]; !taken {
+					owned = append(owned, it)
+				}
+			}
+			if len(owned) == 0 {
+				continue
+			}
+			animID := int(rec.AnimID)
+			name, ok := animStateNames[animID]
+			if !ok {
+				name = "Unknown"
+			}
+			label := fmt.Sprintf("0x%02X_%s", animID, name)
+			gi := len(p.groups)
+			p.groups = append(p.groups, clipGroup{
+				animID: animID, mapped: true, members: members, owned: owned,
+				name: fmt.Sprintf("%s_0x%X", label, members[0].dictID),
+			})
+			for _, it := range owned {
+				p.groupOf[it.ai] = gi
+				p.layerName[it.ai] = fmt.Sprintf("%s_%s_0x%X", label, it.half(), it.dictID)
+			}
+		}
+	}
+	noTable := len(table) == 0
+	unmappedPair := map[int]int{}
+	for _, it := range items {
+		if _, taken := p.groupOf[it.ai]; taken {
+			continue
+		}
+		gi, ok := -1, false
+		if noTable {
+			gi, ok = unmappedPair[it.ai/2]
+		}
+		if !ok {
+			label := fmt.Sprintf("Unmapped_action%d", it.ai)
+			if noTable {
+				label = fmt.Sprintf("Unmapped_pair%d", it.ai/2)
+			}
+			gi = len(p.groups)
+			p.groups = append(p.groups, clipGroup{name: fmt.Sprintf("%s_0x%X", label, it.dictID)})
+			if noTable {
+				unmappedPair[it.ai/2] = gi
+			}
+		}
+		p.groups[gi].members = append(p.groups[gi].members, it)
+		p.groups[gi].owned = append(p.groups[gi].owned, it)
+		p.groupOf[it.ai] = gi
+		p.layerName[it.ai] = fmt.Sprintf("Unmapped_action%d_%s_0x%X", it.ai, it.half(), it.dictID)
+	}
+	return p
 }
 
 // animChanSpec references the document-global accessors of one animated joint
@@ -961,29 +1063,22 @@ func buildAnimation(name string, specs []animChanSpec) Animation {
 // merge is a lossless union of channels that reuses the same accessors — no
 // extra buffer bytes).  The merged clips are emitted FIRST so a viewer that
 // auto-plays animation[0] defaults to the correct composited pose; the layers
-// follow for anyone compositing by hand.  Actions arrive as consecutive pairs
-// (pairIdx = ai/2).
+// follow for anyone compositing by hand.  Which two ActionSets form a pair, and
+// each clip's name, come from the sprite's 0x2910 animation table (planClips).
 func exportAnimations(b *Builder, asset *eqoa.Asset, jointNodeIndices []int) {
-	// Per-pair accumulator for the merged full-body clips. Layer clips are held
-	// aside and appended after the merged clips so the merged ones come first.
-	pairSpecs := map[int][]animChanSpec{}
-	pairName := map[int]string{}
-	var pairOrder []int
-	// Layer clips are held with their pair index and emitted after the merged
-	// clips — but only for pairs that actually have TWO contributing layers. When
-	// one half of a pair is empty (e.g. a prop whose action has only a "lower"
-	// layer — clockwork gears, banners), the merged clip is byte-identical to the
-	// lone layer, and emitting both leaves two identical animations targeting the
-	// same joints. A viewer that plays every clip in a zone GLB then applies both,
-	// compounding each member's rotate-about-center translation (T = C − R·C) and
-	// flinging it off its axle — the "warped gear/clock-hand" artifact. Skipping
-	// the redundant duplicate is safe: the merged clip already carries it.
-	type layerClip struct {
-		pair int
-		anim Animation
-	}
-	var layerClips []layerClip
-	pairLayers := map[int]int{}
+	// Each exported ActionSet's channel specs, by its index in asset.Actions.
+	// planClips (below) decides which ActionSets make up each merged clip.
+	// Layer clips are emitted only for clips with TWO or more contributing
+	// layers. When one half is empty (e.g. a prop whose action has only a
+	// "lower" layer — clockwork gears, banners), the merged clip is
+	// byte-identical to the lone layer, and emitting both leaves two identical
+	// animations targeting the same joints. A viewer that plays every clip in a
+	// zone GLB then applies both, compounding each member's rotate-about-center
+	// translation (T = C − R·C) and flinging it off its axle — the "warped
+	// gear/clock-hand" artifact. Skipping the redundant duplicate is safe: the
+	// merged clip already carries it.
+	var items []clipItem
+	specsOf := map[int][]animChanSpec{}
 	// Joints whose default (not-playing) pose has already been set from frame 0.
 	posed := map[int]bool{}
 
@@ -1079,33 +1174,25 @@ func exportAnimations(b *Builder, asset *eqoa.Asset, jointNodeIndices []int) {
 		if len(specs) == 0 {
 			continue
 		}
-		// Accumulate the pair's channels for the merged full-body clip.
-		pairIdx := ai / 2
-		if _, seen := pairSpecs[pairIdx]; !seen {
-			pairOrder = append(pairOrder, pairIdx)
-			pairName[pairIdx] = mergedAnimationName(pairIdx, aSet.DictID)
-		}
-		pairSpecs[pairIdx] = append(pairSpecs[pairIdx], specs...)
-		pairLayers[pairIdx]++
-
-		// Hold this half as a standalone "layer" clip (appended after merged, and
-		// only if its pair ends up with two real layers — see pairLayers below).
-		layerClips = append(layerClips, layerClip{
-			pair: pairIdx,
-			anim: buildAnimation(animationName(ai, aSet.DictID, includesRoot), specs),
-		})
+		items = append(items, clipItem{ai: ai, dictID: aSet.DictID, includesRoot: includesRoot})
+		specsOf[ai] = specs
 	}
 
 	// Merged full-body clips first (so animation[0] is a correct composited
-	// pose), then the individual upper/lower layers — but only for pairs that
-	// genuinely have two layers, so a single-layer action isn't duplicated.
-	for _, pi := range pairOrder {
-		b.Doc.Animations = append(b.Doc.Animations,
-			buildAnimation(pairName[pi], pairSpecs[pi]))
+	// pose), then the individual upper/lower layers in action order — but only
+	// for clips that genuinely have two layers, so a single-layer action isn't
+	// duplicated.
+	plan := planClips(items, asset.AnimTable)
+	for _, g := range plan.groups {
+		var specs []animChanSpec
+		for _, it := range g.members {
+			specs = append(specs, specsOf[it.ai]...)
+		}
+		b.Doc.Animations = append(b.Doc.Animations, buildAnimation(g.name, specs))
 	}
-	for _, lc := range layerClips {
-		if pairLayers[lc.pair] >= 2 {
-			b.Doc.Animations = append(b.Doc.Animations, lc.anim)
+	for _, it := range items {
+		if len(plan.groups[plan.groupOf[it.ai]].members) >= 2 {
+			b.Doc.Animations = append(b.Doc.Animations, buildAnimation(plan.layerName[it.ai], specsOf[it.ai]))
 		}
 	}
 }

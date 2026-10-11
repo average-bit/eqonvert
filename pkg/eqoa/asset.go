@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"math"
 )
 
 type Asset struct {
@@ -28,6 +29,17 @@ type Asset struct {
 	AttachSlots []CSpriteAttachSlot
 	// AttachSlotsErr is set when a 0x2920 object exists but failed to parse.
 	AttachSlotsErr error
+	// AnimTable is the CSprite's 0x2910 v3 animation table (see
+	// ParseCSpriteAnimations), or nil when the sprite has none: not a CSprite,
+	// the undecoded v0 table in DEBUG, or a table that failed to parse
+	// (AnimTableErr). The glTF export names and pairs its clips from it.
+	AnimTable []CSpriteAnimation
+	// AnimTableErr is set when a v3 0x2910 exists but failed to parse.
+	AnimTableErr error
+	// SizeFactor is the CSprite's 0x2710 size factor (CSpriteHeader), or 0
+	// when the sprite has none or it is not a positive finite number. The glTF
+	// export applies it as the scale of the sprite's root node.
+	SizeFactor float32
 }
 
 func IsSprite(objType uint16) bool {
@@ -36,6 +48,19 @@ func IsSprite(objType uint16) bool {
 		return true
 	}
 	return false
+}
+
+// IsSkinnedSprite reports whether objType is a CSprite (0x2700) or HSprite
+// (0x2200): a model whose GLB also draws the sub-sprite meshes beneath it.
+func IsSkinnedSprite(objType uint16) bool {
+	return objType == 0x2700 || objType == 0x2200
+}
+
+// IsSubSprite reports whether objType is a sub-sprite mesh (0x2310 or 0x2320).
+// Under a CSprite or HSprite such a mesh is a part of that model, not a model of
+// its own.
+func IsSubSprite(objType uint16) bool {
+	return objType == 0x2310 || objType == 0x2320
 }
 
 func isSpriteHeader(objType uint16) bool {
@@ -61,6 +86,23 @@ func LoadAsset(r io.ReadSeeker, obj *ESFObject, order binary.ByteOrder) (*Asset,
 					asset.ID = order.Uint32(body[0:4])
 				}
 			}
+		}
+	}
+
+	if asset.ObjectType == 0x2700 {
+		for _, child := range obj.Children {
+			if uint16(child.Header.ObjectType) != 0x2710 {
+				continue
+			}
+			if body, err := child.ReadBody(r); err == nil {
+				if h, err := ParseCSpriteHeader(body, order); err == nil {
+					f := float64(h.SizeFactor)
+					if f > 0 && !math.IsInf(f, 0) {
+						asset.SizeFactor = h.SizeFactor
+					}
+				}
+			}
+			break
 		}
 	}
 
@@ -144,6 +186,23 @@ func LoadAsset(r io.ReadSeeker, obj *ESFObject, order binary.ByteOrder) (*Asset,
 			} else {
 				asset.AttachSlots = sl
 			}
+		}
+	}
+
+	// The 0x2910 animation table is a direct child of the CSprite.
+	if asset.ObjectType == 0x2700 {
+		for _, c := range obj.Children {
+			if uint16(c.Header.ObjectType) != 0x2910 || c.Header.ObjectVersion != 3 {
+				continue
+			}
+			body, err := c.ReadBody(r)
+			if err == nil {
+				asset.AnimTable, err = ParseCSpriteAnimations(body, c.Header.ObjectVersion, order)
+			}
+			if err != nil {
+				asset.AnimTable, asset.AnimTableErr = nil, err
+			}
+			break
 		}
 	}
 

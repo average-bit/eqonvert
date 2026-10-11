@@ -70,7 +70,7 @@ type ParticleSprite struct {
 
 // ParseParticleSprite decodes a 0xC100 ParticleSprite object. Its children are a
 // 0xC101 header (the definition dictID) and a 0xC000 ParticleDefinition. The
-// definition in turn holds: 0xC010 (texture dictID), a 0x1000 Surface (the
+// definition in turn holds: 0xC010 (the definition's own id), a 0x1000 Surface (the
 // particle texture), and 0xC020 — the flat parameter block that
 // ParseParticleDefinition decodes.
 func ParseParticleSprite(r io.ReadSeeker, obj *ESFObject, order binary.ByteOrder) (*ParticleSprite, error) {

@@ -251,6 +251,101 @@ func (za *ZoneAssembler) embedOneSurface(s *eqoa.Surface) {
 	za.surfaceAlphaMode[s.DictID] = alphaModeFor(s, false)
 }
 
+// animatedSurfaceKind and iceSurfaceDictIDs are curated sets of global surface
+// DictIDs, confirmed by isolating the surface in the zone geometry and inspecting
+// the texture (appearance alone is unreliable). EQOA carries NO intrinsic
+// water/ice/etc. flag -- the 0x1001 surface record is a pure texture bitmap and the
+// material header differs from terrain only by format version -- so these roles are
+// identified by their known shared surface IDs.
+//
+// Key finding: special SURFACES scroll (water/lava move; sky and spell glows
+// animate). The still blue "ocean-looking" textures are the SEA FLOOR seen through
+// the transparent water, NOT the water itself -- those flat sea-floor DictIDs were
+// removed after geometry-viewer confirmation. So water (and lava/sky/magic) live in
+// the scrolling set, and every entry here also carries eqoaAnimated.
+//
+// A scrolling surface DictID can be REUSED in different roles by placement (water in
+// a harbour, a glow on a building wall). Only surfaces that are the SAME role
+// everywhere are listed; genuinely placement-dependent reuse is left eqoaAnimated-
+// only for the runtime to disambiguate from geometry + collision. Ice is separate:
+// it is a solid, occluding, walk-on surface and does NOT scroll.
+var animatedSurfaceKind = map[uint32]string{
+	// water -- passable, swimmable, transparent
+	0x43C9674D: "water", 0xB41E36AA: "water", 0x9636252B: "water", 0xDB8F172E: "water",
+	0x65D4D172: "water", 0x6977E439: "water", 0xE67DD541: "water", 0x12A521F7: "water",
+	0xD372ACB7: "water", 0xF5958202: "water", 0x650A8E2C: "water", 0x3532D4F5: "water",
+	0x9F2CCC9E: "water", 0xB38738EB: "water", 0xD4F01EF0: "water",
+	// lava -- emissive, hot
+	0x733FFEA2: "lava", 0xF0A171F4: "lava",
+	// sky -- scrolling cloud/backdrop
+	0xD64FB0F3: "sky",
+	// magic -- ambient spell/effect glows, often on building geometry
+	0x5E08E06B: "magic", 0x4F8CCB84: "magic", 0x87C42DFA: "magic", 0xA107ABD6: "magic",
+	0x55281650: "magic", 0xB898BEC9: "magic", 0xBC5FE012: "magic", 0x8C26E205: "magic",
+	0x6CC21194: "magic", 0x434AF2EE: "magic", 0xE3ED6798: "magic", 0x64F90FED: "magic",
+	0x3E9A5F1E: "magic", 0xACA4710B: "magic", 0xE6F73E3D: "magic", 0x62F56041: "magic",
+}
+
+var iceSurfaceDictIDs = map[uint32]bool{
+	0x48F1CE90: true, 0x94ED0567: true, 0x50BBA7E2: true,
+}
+
+// surfaceExtras returns the per-material glTF extras describing special-surface
+// semantics, or nil for an ordinary static surface. It never alters geometry or
+// normals -- it only annotates, so the eqoa-xr runtime can pick a shader and
+// behaviour. A material may be both animated and a known role (scrolling water), so
+// the flags are merged into one payload. The keys:
+//
+//	eqoaAnimated + eqoaScroll[u,v] : non-zero UV scroll (scrolling water/lava/sky/glow)
+//	eqoaWater : known water surface -- passable, swimmable, transparent
+//	eqoaLava  : known lava surface  -- emissive, hot
+//	eqoaSky   : known sky surface   -- scrolling backdrop
+//	eqoaMagic : known spell/effect glow (often on building geometry)
+//	eqoaIce   : known ice surface   -- solid, occluding, walk-on (non-animated)
+func surfaceExtras(m *eqoa.Material) json.RawMessage {
+	ex := map[string]interface{}{}
+	// Is this material animated? (any layer scrolls)
+	animated := false
+	for _, layer := range m.Layers {
+		if layer.Scroll[0] != 0 || layer.Scroll[1] != 0 {
+			ex["eqoaAnimated"] = true
+			ex["eqoaScroll"] = []float32{layer.Scroll[0], layer.Scroll[1]}
+			animated = true
+			break
+		}
+	}
+	// Roles. The animated roles (water/lava/sky/magic) were classified from the
+	// SCROLLING surface, so they only apply when the material actually scrolls --
+	// the same texture reused in a static material is a different thing (a building
+	// detail, not swimmable water). This keeps the role a strict subset of
+	// eqoaAnimated and drops static reuses. Ice is non-animated and matches regardless.
+	for _, layer := range m.Layers {
+		if animated {
+			if kind, ok := animatedSurfaceKind[layer.TexID]; ok {
+				switch kind {
+				case "water":
+					ex["eqoaWater"] = true
+				case "lava":
+					ex["eqoaLava"] = true
+				case "sky":
+					ex["eqoaSky"] = true
+				case "magic":
+					ex["eqoaMagic"] = true
+				}
+				break
+			}
+		}
+		if iceSurfaceDictIDs[layer.TexID] {
+			ex["eqoaIce"] = true
+			break
+		}
+	}
+	if len(ex) == 0 {
+		return nil
+	}
+	return mustJSON(ex)
+}
+
 // buildMaterials creates GLTF materials for each entry in each matArr and appends
 // them to the palette table. prefix is used for naming ("p" for zone palette,
 // "s" for sprite). Returns the starting material index of the first palette.
@@ -301,6 +396,9 @@ func (za *ZoneAssembler) buildMaterials(r io.ReadSeeker, matArrs []*eqoa.ESFObje
 			}
 			if gm.PBRMetallicRoughness.BaseColorTexture == nil {
 				gm.PBRMetallicRoughness.BaseColorFactor = []float32{0.65, 0.65, 0.65, 1.0}
+			}
+			if ex := surfaceExtras(m); ex != nil {
+				gm.Extras = ex
 			}
 			za.b.Doc.Materials = append(za.b.Doc.Materials, gm)
 		}
@@ -756,7 +854,13 @@ func (za *ZoneAssembler) AddAnimatedSpriteNode(r io.ReadSeeker, asset *eqoa.Asse
 	n.Matrix = nil
 	n.Translation = []float32{pos[0], pos[1], pos[2]}
 	n.Rotation = mat3ToQuat(EulerRotMatrix(rot))
-	n.Scale = []float32{scale, scale, scale}
+	// The sprite's own size factor (set on this node by the export) is kept
+	// under the actor's scale.
+	k := scale
+	if asset.SizeFactor > 0 {
+		k = scale * asset.SizeFactor
+	}
+	n.Scale = []float32{k, k, k}
 	za.b.AddSceneNode(rootIdx)
 
 	// Extend the zone bbox by the actor position (the sprite is small vs a zone).

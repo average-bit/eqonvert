@@ -126,8 +126,13 @@ A "sprite" is any renderable entity. Character models are usually a
 ├── 0x2400 HSpriteHierarchy     (skeleton)
 ├── 0x5000 RefMap               (bone map — immediately AFTER the hierarchy)
 ├── 0x2450 HSpriteTriggers, misc
-└── 0x2920 CSpriteASlotList     (attach slots — where held items go)
+├── 0x2900 … 0x2915             (mesh id, animation table, slot table)
+├── 0x2920 CSpriteASlotList     (attach slots — where held items go)
+└── 0x2930 … 0x2960             (v6/v7 additions, particle effects)
 ```
+
+The exact list depends on the CSprite's version; see
+[CSprite records](#csprite-records).
 
 ⚠️ Sprites carry **multiple 0x5000 RefMaps** with different meanings. The
 bone map is specifically the one following the 0x2400 hierarchy in the same
@@ -228,6 +233,91 @@ The same node identity is in the GLB itself three ways: the joint's
 0x2400 hierarchy, so `skin.joints[node_index]` is the node), and each joint
 node's `extras.node_index`.
 
+## CSprite records
+
+Decoded from the bytes of both discs and checked on every CSprite (855
+Frontiers, 419 vanilla: CHAR, CHARSEL, DEBUG and the Frontiers zone files).
+Parsers are in `pkg/eqoa/csprite.go` (`ReadCSpriteRecords`). A field gets a
+name only when the data proves it; the rest are `UnknownN`, N being the byte
+offset. Of these, only the 0x2710 SizeFactor changes the export.
+
+**Child list by version.** Fixed per version on both discs:
+
+| Version | Children, in order | Where |
+|---|---|---|
+| v3 | 2710 1110 5000 2800 2610 2400 5000 2900 2910 2915 2920 | DEBUG only |
+| v5 | 2710 1110 5000 B070 2800 2610 2400 5000 2450 2900 2910 2915 2920 2930 | one sprite in CHAR |
+| v6 | v5 + 2940 | CHAR, CHARSEL (vanilla) |
+| v7 | v6 + 2950 2960 | CHAR, CHARSEL, zone files (Frontiers only) |
+
+**0x2710 v4** (48 bytes, `ParseCSpriteHeader`): `u32 ID` (the CSprite id; the
+0x2700 has no body), `6 × f32 Unknown4`, `u32 Unknown28` (0..3), `f32
+SizeFactor` at +32, `u32 Unknown36/40/44` (small integers). SizeFactor is a
+uniform size factor: sprites that share one skeleton and the same converted
+geometry differ in all six Unknown4 floats by their SizeFactor ratio (18
+pairs, within 1%, measured with the tunaria JS port; leopards
+0x125E78F0..F3: 0.6 / 0.8 / 1.0 / 1.2; alligators 0x3E0EBFE1 0.8 and
+0x88806543 0.5). The Unknown4 floats follow a box min/max pattern but are
+several times wider than the mesh. The export applies SizeFactor as the scale
+of the `Sprite_0x...` root node, the parent of the skeleton's root joints; a
+zone actor multiplies it into its own scale. Whether the engine scales the
+skeleton, the mesh or both is not measured.
+
+**0x2900** (12 bytes): `u32 Unknown0` (always 1), `u32 MeshID`, `u32 Unknown8`
+(always 0). MeshID equals the dword at the sibling 0x2800 raw +24, which is the
+first body dword of the one grandchild under 0x2800: a 0x2321 (2800 > 2320 >
+2321) or a 0x2A50 (2800 > 2A40 > 2A50).
+
+**0x2910 v3** animation table: `u32 count`, then 44-byte records:
+
+```
++0  u32 ActionID   a 0x2600 dictID in the same sprite's 0x2610
++4  u32 Action2ID  0, or the 0x2600 right after ActionID in 0x2610 (same frame count)
++8  u32 AnimID     strictly increasing within a sprite
++12 f32 Unknown12
++16 u32 Unknown16  0 or 1
++20 u32 SoundID    0 or a sound: the DictID of a 0xB010 AdpcmHeader
++24 f32 Unknown24
++28 f32 Unknown28
++32 u32 Sound2ID   0 or a second sound (0xB010 DictID); set in 28 records
++36 f32 Unknown36
++40 u32 Unknown40
+```
+
+Together the records of a sprite use every 0x2600 in its 0x2610. The only other
+0x2910 version, v0 in DEBUG, has 16-byte records and is not decoded.
+
+**0x2915 v1** slot table: `u32 count`, then `(i32 slot, i32 nodeIndex)` pairs,
+the 0x2920 layout. Every nodeIndex is a 0x2400 joint index, and every 0x2920
+pair appears in 0x2915 unchanged; 0x2915 goes past slot 2. What slots 3 and up
+are for is unknown.
+
+**0x2950** (v7): no body; its children are 0xC000 ParticleDefinitions (see
+[Particle emitters](#particle-emitters)). Empty in most sprites; 30 Frontiers
+CHAR sprites hold 49 definitions between them.
+
+**0x2960** (v7): `u32 count`, then 32-byte records. `+0 ParticleID` is the
+0xC010 id of a definition in the same sprite's 0x2950, and the set of ids used
+equals the set defined. `+12` is below the joint count in every record (a joint
+index, not proven). The rest: `+4`, `+8`, `+20` always 0, `+16` 0 or 1, `+24`
+one of two values per sprite, `+28` always 500.
+
+**0x2A40** two-mesh switch, found in 0x2800 in place of a single 0x2320 (60
+Frontiers sprites, 40 vanilla):
+
+```
+0x2A40
+├── 0x2A50  u32 id (what 0x2900 MeshID names), 6 × f32 (Unknown4)
+├── 0x2A60  two 0x2320 SkinSubSprites
+└── 0x2A70  u32 count, count × (u32 sub-sprite id, f32 Unknown4)
+```
+
+0x2A70 entry i names the i-th 0x2320 in 0x2A60 (its 0x2321 dword 0). The first
+mesh always has more vertices than the second, and its float is 10.0 (15.0 in 8
+vanilla sprites) against 100.0 for the second: consistent with a switch
+distance, not proven. The 0x2A50 floats follow a box min/max pattern, also not
+proven.
+
 ## Meshes — PrimBuffer (0x1200) / SkinPrimBuffer (0x1210)
 
 Header (after optional dictID when ObjectVersion > 1):
@@ -272,6 +362,39 @@ per-sprite instead of per-vertex causes seams between terrain sub-blocks.
 
 Surfaces referenced by no material (AO/detail maps) are skipped during export
 to avoid phantom near-black textures in the GLB.
+
+### Special-surface semantics (zone material `extras`)
+
+Each material layer is 68 bytes and ends with a 2-float **UV scroll rate**
+(`MaterialLayer.Scroll`), the engine's marker for an animated surface. EQOA has
+no intrinsic water/ice flag — the `Surface` record is a pure texture bitmap and
+a water material differs from terrain only by format version — so zone materials
+are annotated (geometry untouched) via glTF `extras` so a runtime can pick a
+shader and behaviour:
+
+| extras key | meaning | source signal |
+|------------|---------|---------------|
+| `eqoaAnimated` + `eqoaScroll:[u,v]` | scrolling surface (water, lava, sky, spell glow) | non-zero layer UV scroll |
+| `eqoaWater` | passable, swimmable, transparent water | layer `TexID` in the curated water set |
+| `eqoaLava`  | emissive, hot lava | curated lava set |
+| `eqoaSky`   | scrolling sky/cloud backdrop | curated sky set |
+| `eqoaMagic` | ambient spell/effect glow (often on buildings) | curated magic set |
+| `eqoaIce`   | solid, occluding, walk-on ice (non-animated) | curated ice set |
+
+The role sets (`animatedSurfaceKind` + `iceSurfaceDictIDs` in
+`pkg/gltf/zone_assembler.go`) are global surface DictIDs confirmed by isolating
+the surface in the zone geometry and inspecting the texture (appearance alone is
+unreliable — the blue "ocean" textures turned out to be the sea *floor* seen
+through the transparent water, not the water surface). Water/lava/sky/magic all
+scroll, so they also carry `eqoaAnimated`. A scrolling surface DictID can be
+reused in different roles by placement, so only surfaces that are the same role
+everywhere are listed; placement-dependent reuse stays `eqoaAnimated`-only for
+the runtime to disambiguate from geometry + collision.
+
+Normals are never altered — a flat pool and a vertical waterfall keep their own
+orientation, and the runtime owns the water shader, swim/underwater camera
+effect, and the (future) dedicated lava/ice shaders. Collision (swim-through vs
+walk-on) comes from the separate collision mesh, not these tags.
 
 **Fullscreen UI backdrops are split across textures.** The GS has no
 1024-wide texture format and only 4MB of VRAM, so hi-res screens (title,
@@ -345,10 +468,10 @@ not geometry. On disc:
 0xC100 ParticleSprite
   0xC101 header            u32 definition dictID
   0xC000 ParticleDefinition (NumberOfSubObjects is a format flag, not a count)
-    0xC010                 u32 texture dictID
+    0xC010                 u32 definition id (its own id, not the texture)
     0x1000 Surface         the particle sprite image
     0xC020                 flat parameter block:
-                           u32 textureDictID, i32 blendMode, i32 zWrite,
+                           u32 textureDictID (see below), i32 blendMode, i32 zWrite,
                            i32 zTest, i32 textureConfig, i32 motifCount-1,
                            then per motif (name[32] for motif>0):
                              13× f32 friction, birthrate(+var), lifespan(+var),
@@ -360,6 +483,12 @@ not geometry. On disc:
                              6× vec3 inner/outer offset+hpr, nozzle axis+hpr
                              i32 gravityOn (ObjectVersion ≥ 1 only)
 ```
+
+The texture is 0xC020 word 0, not 0xC010. 0xC010 never equals it: it is the
+definition's own id, the one a CSprite's 0x2960 refers to. When the 0xC000
+holds a 0x1000 Surface, word 0 is that Surface's dictID in every definition on
+both discs (1425 Frontiers, 1169 vanilla). Definitions with no Surface of their
+own (the 332 in SPELLFX) name a Surface stored elsewhere on the disc.
 
 Emitters nested in a `GroupSprite` (0x2C00) — e.g. a wall-torch flame — are
 positioned by the group's 0x2C30 member array: per member
