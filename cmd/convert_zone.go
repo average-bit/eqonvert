@@ -1212,6 +1212,38 @@ func (zb *zoneBuildState) placeActor(o *eqoa.ESFObject) {
 		zb.actEmpty++
 		return
 	}
+	// ZONE_ACTOR_DEBUG per-actor type dump (optionally limited to one zone via
+	// ZONE_ACTOR_DEBUG_ZONE=<idx>): reveals which sprite ObjectType each placed actor
+	// resolves to (e.g. 0x2C00 GroupSprite vs 0x2A00 LOD), its merged mesh count, and
+	// its Euler rotation — to diagnose mis-rotated multi-member props (bridges/dams).
+	if os.Getenv("ZONE_ACTOR_DEBUG") != "" {
+		if zf := os.Getenv("ZONE_ACTOR_DEBUG_ZONE"); zf == "" || zf == fmt.Sprintf("%d", zb.zoneIdx) {
+			var mn, mx [3]float32
+			first := true
+			for _, me := range asset.Meshes {
+				for _, fgx := range me.FaceGroups {
+					for _, vx := range fgx.Vertices {
+						if first {
+							mn, mx, first = vx.Pos, vx.Pos, false
+							continue
+						}
+						for k := 0; k < 3; k++ {
+							if vx.Pos[k] < mn[k] {
+								mn[k] = vx.Pos[k]
+							}
+							if vx.Pos[k] > mx[k] {
+								mx[k] = vx.Pos[k]
+							}
+						}
+					}
+				}
+			}
+			fmt.Fprintf(os.Stderr, "[actorT z%d] type=0x%04X dict=0x%08X meshes=%d rot=(%.2f,%.2f,%.2f) pos=(%.0f,%.0f,%.0f) sz=(%.0f,%.0f,%.0f)\n",
+				zb.zoneIdx, uint16(sprObj.Header.ObjectType), o.DictID, len(asset.Meshes),
+				rot[0], rot[1], rot[2], pos[0], pos[1], pos[2],
+				mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2])
+		}
+	}
 	switch {
 	case viaDir:
 		zb.actDir++
