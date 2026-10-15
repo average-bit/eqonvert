@@ -36,12 +36,15 @@ func TestEulerRotMatrixIdentity(t *testing.T) {
 	}
 }
 
-// TestEulerRotMatrixYaw90: a 90° yaw about the vertical (Height/Y) axis must map
-// East(+X) to North(+Z) and leave Height(+Y) fixed — the common actor case.
+// TestEulerRotMatrixYaw90: a 90° yaw about the vertical (Height/Y) axis maps
+// East(+X) to South(-Z) and leaves Height(+Y) fixed. EQOA yaw is opposite-signed
+// to the naive right-handed assumption — this sign was visually confirmed against
+// the Freeport river bridge (0xD342E443), which rendered ~50° mirror-wrong until
+// the yaw was negated (see EulerRotMatrix / AddSpriteAtWorldPos).
 func TestEulerRotMatrixYaw90(t *testing.T) {
 	m := EulerRotMatrix([3]float32{float32(math.Pi / 2), 0, 0})
-	vecEq(t, apply(m, [3]float32{1, 0, 0}), [3]float32{0, 0, 1}, 1e-5) // East -> North
-	vecEq(t, apply(m, [3]float32{0, 1, 0}), [3]float32{0, 1, 0}, 1e-5) // Height fixed
+	vecEq(t, apply(m, [3]float32{1, 0, 0}), [3]float32{0, 0, -1}, 1e-5) // East -> South
+	vecEq(t, apply(m, [3]float32{0, 1, 0}), [3]float32{0, 1, 0}, 1e-5)  // Height fixed
 }
 
 // applyQuat rotates v by quaternion q=[x,y,z,w].

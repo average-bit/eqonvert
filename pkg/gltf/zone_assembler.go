@@ -685,7 +685,7 @@ func (za *ZoneAssembler) AddSpriteAtWorldPos(asset *eqoa.Asset, pos [3]float32, 
 	// props with only a heading are byte-for-byte unchanged); only the minority
 	// of actors that carry a pitch/roll (props following terrain slope) change.
 	cy := float32(math.Cos(float64(rot[0])))
-	sy := float32(math.Sin(float64(rot[0])))
+	sy := -float32(math.Sin(float64(rot[0]))) // EQOA yaw is opposite-signed; negate (confirmed via Freeport bridge 0xD342E443)
 	cp := float32(math.Cos(float64(rot[1])))
 	sp := float32(math.Sin(float64(rot[1])))
 	cr := float32(math.Cos(float64(rot[2])))
@@ -776,7 +776,7 @@ func (za *ZoneAssembler) AddSpriteAtWorldPos(asset *eqoa.Asset, pos [3]float32, 
 // actor placement the visual mesh receives (see cmd collectSpriteCollision).
 func EulerRotMatrix(rot [3]float32) [9]float32 {
 	cy := float32(math.Cos(float64(rot[0])))
-	sy := float32(math.Sin(float64(rot[0])))
+	sy := -float32(math.Sin(float64(rot[0]))) // EQOA yaw is opposite-signed; negate (confirmed via Freeport bridge 0xD342E443)
 	cp := float32(math.Cos(float64(rot[1])))
 	sp := float32(math.Sin(float64(rot[1])))
 	cr := float32(math.Cos(float64(rot[2])))
